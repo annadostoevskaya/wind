@@ -52,8 +52,8 @@
 #define CURRENT_SCALE           (20.0f / 1.65f)
 #define VOLTAGE_SCALE           12.23f
 
-#define BAT_DIV_R_TOP           100000.0f
-#define BAT_DIV_R_BOTTOM        10000.0f
+#define BAT_DIV_R_TOP           10000.0f
+#define BAT_DIV_R_BOTTOM        13000.0f
 #define BAT_LOW_THRESHOLD_V     3.6f
 
 #define PULSES_PER_REV          6U
