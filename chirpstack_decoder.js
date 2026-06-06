@@ -8,7 +8,25 @@ function decodeUplink(input) {
   var data = {};
 
   if (input.fPort === 2) {
-    if (input.bytes.length === 15 && input.bytes[0] === 1) {
+    if (input.bytes.length === 33 && input.bytes[0] === 2) {
+      data.voltage_a = readFixed2U16(input.bytes, 1);
+      data.voltage_b = readFixed2U16(input.bytes, 3);
+      data.voltage_c = readFixed2U16(input.bytes, 5);
+      data.current_a = readFixed2U16(input.bytes, 7);
+      data.current_b = readFixed2U16(input.bytes, 9);
+      data.current_c = readFixed2U16(input.bytes, 11);
+      data.revolutions = readFixed2U16(input.bytes, 13);
+      data.accel_x_raw = readU16(input.bytes, 15);
+      data.accel_y_raw = readU16(input.bytes, 17);
+      data.accel_z_raw = readU16(input.bytes, 19);
+      data.battery_voltage = readFixed2U16(input.bytes, 21);
+
+      var temperatureMask = input.bytes[23];
+      data.temperature_1 = readTemperature(input.bytes, 24, temperatureMask, 0);
+      data.temperature_2 = readTemperature(input.bytes, 26, temperatureMask, 1);
+      data.temperature_3 = readTemperature(input.bytes, 28, temperatureMask, 2);
+      data.temperature_4 = readTemperature(input.bytes, 30, temperatureMask, 3);
+    } else if (input.bytes.length === 15 && input.bytes[0] === 1) {
       data.voltage_a = readFixed2U16(input.bytes, 1);
       data.voltage_b = readFixed2U16(input.bytes, 3);
       data.voltage_c = readFixed2U16(input.bytes, 5);
@@ -57,7 +75,24 @@ function decodeUplink(input) {
 }
 
 function readFixed2U16(bytes, offset) {
-  return (bytes[offset] | (bytes[offset + 1] << 8)) / 100;
+  return readU16(bytes, offset) / 100;
+}
+
+function readU16(bytes, offset) {
+  return bytes[offset] | (bytes[offset + 1] << 8);
+}
+
+function readTemperature(bytes, offset, mask, bit) {
+  if ((mask & (1 << bit)) === 0) {
+    return null;
+  }
+
+  var value = readU16(bytes, offset);
+  if (value & 0x8000) {
+    value -= 0x10000;
+  }
+
+  return value / 100;
 }
 
 function parseFields(text) {

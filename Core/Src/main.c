@@ -71,7 +71,7 @@
 #define RAK_PAYLOAD_TEXT_SIZE   160U
 #define RAK_PAYLOAD_HEX_SIZE    ((RAK_PAYLOAD_TEXT_SIZE * 2U) + 1U)
 #define RAK_SEND_CMD_SIZE       (24U + RAK_PAYLOAD_HEX_SIZE)
-#define RAK_PART1_PAYLOAD_SIZE  15U
+#define RAK_MEAS_PAYLOAD_SIZE   33U
 #define RAK_JOIN_TIMEOUT_MS     10000U
 #define RAK_AT_TIMEOUT_MS       5000U
 #define RAK_BOOT_DELAY_MS       1500U
@@ -162,18 +162,13 @@ static float BatteryVoltageFromRaw(uint16_t raw);
 
 static void TextAppend(char *dst, uint16_t dst_size, uint16_t *pos, const char *src);
 static void TextAppendInt32(char *dst, uint16_t dst_size, uint16_t *pos, int32_t value);
-static void TextAppendFixed2(char *dst, uint16_t dst_size, uint16_t *pos, float value);
-static void TextAppendRaw(char *dst, uint16_t dst_size, uint16_t *pos, const char *name, uint16_t raw);
 
 static void RAK_ClearOldUartData(void);
 static bool RAK_WaitForJoin(uint32_t timeout_ms);
 static bool RAK_SendCommandAndWaitOK(const char *cmd, uint32_t timeout_ms);
 static void RAK_BytesToHex(const uint8_t *bytes, uint16_t length, char *hex, uint16_t hex_size);
-static void RAK_AsciiToHex(const char *ascii, char *hex, uint16_t hex_size);
 static bool RAK_SendBytesPayload(uint8_t port, const uint8_t *payload, uint16_t payload_size);
-static bool RAK_SendAsciiPayload(uint8_t port, const char *payload_text);
-static bool BuildPayloadPart1(uint8_t *payload, uint16_t payload_size);
-static bool BuildPayloadPart2(char *payload, uint16_t payload_size);
+static bool BuildMeasurementPayload(uint8_t *payload, uint16_t payload_size);
 
 static void DS18B20_LineRelease(void);
 static void DS18B20_LineLow(void);
@@ -296,8 +291,7 @@ static void App_StartMeasurements(void)
 
 static void App_ProcessMeasurementWindow(void)
 {
-  char payload[RAK_PAYLOAD_TEXT_SIZE] = {0};
-  uint8_t payload_part1[RAK_PART1_PAYLOAD_SIZE] = {0};
+  uint8_t payload[RAK_MEAS_PAYLOAD_SIZE] = {0};
   float local_sum[ADC_CHANNELS];
   float local_sum_sq[ADC_CHANNELS];
   uint32_t pulses;
@@ -359,19 +353,8 @@ static void App_ProcessMeasurementWindow(void)
   ReadAuxAnalogInputs();
   DS18B20_ReadAllTemperatures();
 
-  send_ok = BuildPayloadPart1(payload_part1, sizeof(payload_part1));
-  send_ok = RAK_SendBytesPayload(2, payload_part1, sizeof(payload_part1)) && send_ok;
-
-  if (BuildPayloadPart2(payload, sizeof(payload)) == true)
-  {
-    Debug_Log("[PAYLOAD] part2: %s\r\n", payload);
-    send_ok = RAK_SendAsciiPayload(3, payload) && send_ok;
-  }
-  else
-  {
-    Debug_Log("[PAYLOAD] part2 build failed\r\n");
-    send_ok = false;
-  }
+  send_ok = BuildMeasurementPayload(payload, sizeof(payload));
+  send_ok = RAK_SendBytesPayload(2, payload, sizeof(payload)) && send_ok;
 
   if (send_ok == true)
   {
@@ -570,37 +553,6 @@ static void TextAppendInt32(char *dst, uint16_t dst_size, uint16_t *pos, int32_t
   TextAppend(dst, dst_size, pos, &buf[buf_pos]);
 }
 
-static void TextAppendFixed2(char *dst, uint16_t dst_size, uint16_t *pos, float value)
-{
-  int32_t scaled = (int32_t)((value * 100.0f) + ((value >= 0.0f) ? 0.5f : -0.5f));
-  int32_t abs_scaled = scaled;
-  int32_t whole;
-  int32_t frac;
-
-  if (abs_scaled < 0)
-  {
-    TextAppend(dst, dst_size, pos, "-");
-    abs_scaled = -abs_scaled;
-  }
-
-  whole = abs_scaled / 100;
-  frac = abs_scaled % 100;
-  TextAppendInt32(dst, dst_size, pos, whole);
-  TextAppend(dst, dst_size, pos, ".");
-  if (frac < 10)
-  {
-    TextAppend(dst, dst_size, pos, "0");
-  }
-  TextAppendInt32(dst, dst_size, pos, frac);
-}
-
-static void TextAppendRaw(char *dst, uint16_t dst_size, uint16_t *pos, const char *name, uint16_t raw)
-{
-  TextAppend(dst, dst_size, pos, name);
-  TextAppend(dst, dst_size, pos, "=");
-  TextAppendInt32(dst, dst_size, pos, raw);
-}
-
 static void RAK_ClearOldUartData(void)
 {
   uint16_t cleared = 0;
@@ -702,11 +654,6 @@ static void RAK_BytesToHex(const uint8_t *bytes, uint16_t length, char *hex, uin
   hex[out] = '\0';
 }
 
-static void RAK_AsciiToHex(const char *ascii, char *hex, uint16_t hex_size)
-{
-  RAK_BytesToHex((const uint8_t *)ascii, (uint16_t)strlen(ascii), hex, hex_size);
-}
-
 static bool RAK_SendHexPayload(uint8_t port, const char *payload_hex)
 {
   char cmd[RAK_SEND_CMD_SIZE] = {0};
@@ -730,15 +677,7 @@ static bool RAK_SendBytesPayload(uint8_t port, const uint8_t *payload, uint16_t 
   return RAK_SendHexPayload(port, payload_hex);
 }
 
-static bool RAK_SendAsciiPayload(uint8_t port, const char *payload_text)
-{
-  char payload_hex[RAK_PAYLOAD_HEX_SIZE] = {0};
-
-  RAK_AsciiToHex(payload_text, payload_hex, sizeof(payload_hex));
-  return RAK_SendHexPayload(port, payload_hex);
-}
-
-static bool BuildPayloadPart1(uint8_t *payload, uint16_t payload_size)
+static bool BuildMeasurementPayload(uint8_t *payload, uint16_t payload_size)
 {
   const float values[] = {
     rms_voltage[0], rms_voltage[1], rms_voltage[2],
@@ -746,12 +685,12 @@ static bool BuildPayloadPart1(uint8_t *payload, uint16_t payload_size)
     revolutions
   };
 
-  if (payload_size < RAK_PART1_PAYLOAD_SIZE)
+  if (payload_size < RAK_MEAS_PAYLOAD_SIZE)
   {
     return false;
   }
 
-  payload[0] = 1U;
+  payload[0] = 2U;
   for (uint8_t i = 0; i < 7U; i++)
   {
     float value = values[i];
@@ -771,39 +710,46 @@ static bool BuildPayloadPart1(uint8_t *payload, uint16_t payload_size)
     payload[2U + (i * 2U)] = (uint8_t)(scaled >> 8);
   }
 
-  return true;
-}
+  payload[15] = (uint8_t)(adc_x_raw & 0xFFU);
+  payload[16] = (uint8_t)(adc_x_raw >> 8);
+  payload[17] = (uint8_t)(adc_y_raw & 0xFFU);
+  payload[18] = (uint8_t)(adc_y_raw >> 8);
+  payload[19] = (uint8_t)(adc_z_raw & 0xFFU);
+  payload[20] = (uint8_t)(adc_z_raw >> 8);
 
-static bool BuildPayloadPart2(char *payload, uint16_t payload_size)
-{
-  uint16_t pos = 0;
+  {
+    float value = battery_voltage;
+    uint16_t scaled;
 
-  payload[0] = '\0';
-  TextAppendRaw(payload, payload_size, &pos, "X", adc_x_raw);
-  TextAppend(payload, payload_size, &pos, ";");
-  TextAppendRaw(payload, payload_size, &pos, "Y", adc_y_raw);
-  TextAppend(payload, payload_size, &pos, ";");
-  TextAppendRaw(payload, payload_size, &pos, "Z", adc_z_raw);
-  TextAppend(payload, payload_size, &pos, ";BAT=");
-  TextAppendFixed2(payload, payload_size, &pos, battery_voltage);
-  TextAppend(payload, payload_size, &pos, ";T=");
+    if (value < 0.0f)
+    {
+      value = 0.0f;
+    }
+    if (value > 655.35f)
+    {
+      value = 655.35f;
+    }
+    scaled = (uint16_t)((value * 100.0f) + 0.5f);
+    payload[21] = (uint8_t)(scaled & 0xFFU);
+    payload[22] = (uint8_t)(scaled >> 8);
+  }
 
+  payload[23] = 0U;
   for (uint8_t i = 0; i < DS18B20_MAX_SENSORS; i++)
   {
-    if (i > 0U)
-    {
-      TextAppend(payload, payload_size, &pos, ",");
-    }
+    int16_t temperature = 0;
 
     if ((i < ds18b20_count) && (ds18b20_temp_ok[i] == true))
     {
-      TextAppendFixed2(payload, payload_size, &pos, ((float)ds18b20_temp_centi[i]) / 100.0f);
+      temperature = (int16_t)ds18b20_temp_centi[i];
+      payload[23] |= (uint8_t)(1U << i);
     }
-    else
-    {
-      TextAppend(payload, payload_size, &pos, "ERR");
-    }
+
+    payload[24U + (i * 2U)] = (uint8_t)((uint16_t)temperature & 0xFFU);
+    payload[25U + (i * 2U)] = (uint8_t)(((uint16_t)temperature) >> 8);
   }
+
+  payload[32] = 0U;
 
   return true;
 }
