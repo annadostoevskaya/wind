@@ -49,11 +49,19 @@
 #define ADC_IDX_IB              4U
 #define ADC_IDX_IC              5U
 
-#define CURRENT_SCALE           (20.0f / 1.65f)
-#define VOLTAGE_SCALE           12.23f
+#define CURRENT_RSHUNT_OHM      0.016f
+#define CURRENT_GAIN_STAGE1     (100000.0f / 8200.0f)
+#define CURRENT_GAIN_TOTAL      (CURRENT_GAIN_STAGE1 / 2.0f)
+#define CURRENT_V_PER_AMP       (CURRENT_RSHUNT_OHM * CURRENT_GAIN_TOTAL)
+
+#define VOLTAGE_R_TOP_OHM       100000.0f
+#define VOLTAGE_R_BOTTOM_OHM    10000.0f
+#define VOLTAGE_DIV_RATIO       (VOLTAGE_R_BOTTOM_OHM / (VOLTAGE_R_TOP_OHM + VOLTAGE_R_BOTTOM_OHM))
+#define VOLTAGE_GAIN_TOTAL      (VOLTAGE_DIV_RATIO / 2.0f)
 
 #define BAT_DIV_R_TOP           10000.0f
 #define BAT_DIV_R_BOTTOM        13000.0f
+#define BAT_VOLTAGE_CORRECTION  1.10f
 #define BAT_LOW_THRESHOLD_V     3.6f
 
 #define PULSES_PER_REV          6U
@@ -324,8 +332,8 @@ static void App_ProcessMeasurementWindow(void)
       var_i = 0.0f;
     }
 
-    rms_voltage[i] = sqrtf(var_v) * (VREF / ADC_MAX) * VOLTAGE_SCALE;
-    rms_current[i] = sqrtf(var_i) * (VREF / ADC_MAX) * CURRENT_SCALE;
+    rms_voltage[i] = sqrtf(var_v) * (VREF / ADC_MAX) / VOLTAGE_GAIN_TOTAL;
+    rms_current[i] = sqrtf(var_i) * (VREF / ADC_MAX) / CURRENT_V_PER_AMP;
 
     mean_v_mv = (int32_t)((mean_v * VREF * 1000.0f) / ADC_MAX);
     mean_i_mv = (int32_t)((mean_i * VREF * 1000.0f) / ADC_MAX);
@@ -512,7 +520,9 @@ static float RawToVoltage(uint16_t raw)
 
 static float BatteryVoltageFromRaw(uint16_t raw)
 {
-  return RawToVoltage(raw) * ((BAT_DIV_R_TOP + BAT_DIV_R_BOTTOM) / BAT_DIV_R_BOTTOM);
+  return RawToVoltage(raw) *
+         ((BAT_DIV_R_TOP + BAT_DIV_R_BOTTOM) / BAT_DIV_R_BOTTOM) *
+         BAT_VOLTAGE_CORRECTION;
 }
 
 static void TextAppend(char *dst, uint16_t dst_size, uint16_t *pos, const char *src)
@@ -1545,6 +1555,11 @@ static void MX_GPIO_Init(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance != TIM2)
+  {
+    return;
+  }
+
+  if (rms_ready != 0U)
   {
     return;
   }
