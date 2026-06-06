@@ -52,6 +52,9 @@ default.size.stdout \
 OBJDUMP_LIST += \
 vetr_srt1.0.list \
 
+OBJCOPY_HEX += \
+vetr_srt1.0.hex \
+
 
 # All Target
 all: main-build
@@ -75,12 +78,17 @@ vetr_srt1.0.list: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
 	@echo 'Finished building: $@'
 	@echo ' '
 
+vetr_srt1.0.hex: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-objcopy  -O ihex $(EXECUTABLES) "vetr_srt1.0.hex"
+	@echo 'Finished building: $@'
+	@echo ' '
+
 # Other Targets
 clean:
-	-$(RM) default.size.stdout vetr_srt1.0.elf vetr_srt1.0.list vetr_srt1.0.map
+	-$(RM) default.size.stdout vetr_srt1.0.elf vetr_srt1.0.hex vetr_srt1.0.list vetr_srt1.0.map
 	-@echo ' '
 
-secondary-outputs: $(SIZE_OUTPUT) $(OBJDUMP_LIST)
+secondary-outputs: $(SIZE_OUTPUT) $(OBJDUMP_LIST) $(OBJCOPY_HEX)
 
 fail-specified-linker-script-missing:
 	@echo 'Error: Cannot find the specified linker script. Check the linker settings in the build configuration.'
