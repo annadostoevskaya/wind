@@ -71,6 +71,7 @@
 #define RAK_PAYLOAD_TEXT_SIZE   160U
 #define RAK_PAYLOAD_HEX_SIZE    ((RAK_PAYLOAD_TEXT_SIZE * 2U) + 1U)
 #define RAK_SEND_CMD_SIZE       (24U + RAK_PAYLOAD_HEX_SIZE)
+#define RAK_PART1_PAYLOAD_SIZE  15U
 #define RAK_JOIN_TIMEOUT_MS     10000U
 #define RAK_AT_TIMEOUT_MS       5000U
 #define RAK_BOOT_DELAY_MS       1500U
@@ -167,9 +168,11 @@ static void TextAppendRaw(char *dst, uint16_t dst_size, uint16_t *pos, const cha
 static void RAK_ClearOldUartData(void);
 static bool RAK_WaitForJoin(uint32_t timeout_ms);
 static bool RAK_SendCommandAndWaitOK(const char *cmd, uint32_t timeout_ms);
+static void RAK_BytesToHex(const uint8_t *bytes, uint16_t length, char *hex, uint16_t hex_size);
 static void RAK_AsciiToHex(const char *ascii, char *hex, uint16_t hex_size);
+static bool RAK_SendBytesPayload(uint8_t port, const uint8_t *payload, uint16_t payload_size);
 static bool RAK_SendAsciiPayload(uint8_t port, const char *payload_text);
-static bool BuildPayloadPart1(char *payload, uint16_t payload_size);
+static bool BuildPayloadPart1(uint8_t *payload, uint16_t payload_size);
 static bool BuildPayloadPart2(char *payload, uint16_t payload_size);
 
 static void DS18B20_LineRelease(void);
@@ -294,6 +297,7 @@ static void App_StartMeasurements(void)
 static void App_ProcessMeasurementWindow(void)
 {
   char payload[RAK_PAYLOAD_TEXT_SIZE] = {0};
+  uint8_t payload_part1[RAK_PART1_PAYLOAD_SIZE] = {0};
   float local_sum[ADC_CHANNELS];
   float local_sum_sq[ADC_CHANNELS];
   uint32_t pulses;
@@ -355,9 +359,8 @@ static void App_ProcessMeasurementWindow(void)
   ReadAuxAnalogInputs();
   DS18B20_ReadAllTemperatures();
 
-  send_ok = BuildPayloadPart1(payload, sizeof(payload));
-  Debug_Log("[PAYLOAD] part1: %s\r\n", payload);
-  send_ok = RAK_SendAsciiPayload(2, payload) && send_ok;
+  send_ok = BuildPayloadPart1(payload_part1, sizeof(payload_part1));
+  send_ok = RAK_SendBytesPayload(2, payload_part1, sizeof(payload_part1)) && send_ok;
 
   if (BuildPayloadPart2(payload, sizeof(payload)) == true)
   {
@@ -684,29 +687,30 @@ static bool RAK_SendCommandAndWaitOK(const char *cmd, uint32_t timeout_ms)
   return false;
 }
 
-static void RAK_AsciiToHex(const char *ascii, char *hex, uint16_t hex_size)
+static void RAK_BytesToHex(const uint8_t *bytes, uint16_t length, char *hex, uint16_t hex_size)
 {
   static const char digits[] = "0123456789ABCDEF";
   uint16_t out = 0;
 
-  while ((*ascii != '\0') && ((out + 2U) < hex_size))
+  for (uint16_t i = 0; (i < length) && ((out + 2U) < hex_size); i++)
   {
-    uint8_t byte = (uint8_t)*ascii;
+    uint8_t byte = bytes[i];
     hex[out++] = digits[(byte >> 4) & 0x0FU];
     hex[out++] = digits[byte & 0x0FU];
-    ascii++;
   }
 
   hex[out] = '\0';
 }
 
-static bool RAK_SendAsciiPayload(uint8_t port, const char *payload_text)
+static void RAK_AsciiToHex(const char *ascii, char *hex, uint16_t hex_size)
 {
-  char payload_hex[RAK_PAYLOAD_HEX_SIZE] = {0};
+  RAK_BytesToHex((const uint8_t *)ascii, (uint16_t)strlen(ascii), hex, hex_size);
+}
+
+static bool RAK_SendHexPayload(uint8_t port, const char *payload_hex)
+{
   char cmd[RAK_SEND_CMD_SIZE] = {0};
   uint16_t pos = 0;
-
-  RAK_AsciiToHex(payload_text, payload_hex, sizeof(payload_hex));
 
   TextAppend(cmd, sizeof(cmd), &pos, "AT+SEND=");
   TextAppendInt32(cmd, sizeof(cmd), &pos, port);
@@ -718,25 +722,54 @@ static bool RAK_SendAsciiPayload(uint8_t port, const char *payload_text)
   return RAK_SendCommandAndWaitOK(cmd, RAK_AT_TIMEOUT_MS);
 }
 
-static bool BuildPayloadPart1(char *payload, uint16_t payload_size)
+static bool RAK_SendBytesPayload(uint8_t port, const uint8_t *payload, uint16_t payload_size)
 {
-  uint16_t pos = 0;
+  char payload_hex[RAK_PAYLOAD_HEX_SIZE] = {0};
 
-  payload[0] = '\0';
-  TextAppend(payload, payload_size, &pos, "VA=");
-  TextAppendFixed2(payload, payload_size, &pos, rms_voltage[0]);
-  TextAppend(payload, payload_size, &pos, ";VB=");
-  TextAppendFixed2(payload, payload_size, &pos, rms_voltage[1]);
-  TextAppend(payload, payload_size, &pos, ";VC=");
-  TextAppendFixed2(payload, payload_size, &pos, rms_voltage[2]);
-  TextAppend(payload, payload_size, &pos, ";IA=");
-  TextAppendFixed2(payload, payload_size, &pos, rms_current[0]);
-  TextAppend(payload, payload_size, &pos, ";IB=");
-  TextAppendFixed2(payload, payload_size, &pos, rms_current[1]);
-  TextAppend(payload, payload_size, &pos, ";IC=");
-  TextAppendFixed2(payload, payload_size, &pos, rms_current[2]);
-  TextAppend(payload, payload_size, &pos, ";REV=");
-  TextAppendFixed2(payload, payload_size, &pos, revolutions);
+  RAK_BytesToHex(payload, payload_size, payload_hex, sizeof(payload_hex));
+  return RAK_SendHexPayload(port, payload_hex);
+}
+
+static bool RAK_SendAsciiPayload(uint8_t port, const char *payload_text)
+{
+  char payload_hex[RAK_PAYLOAD_HEX_SIZE] = {0};
+
+  RAK_AsciiToHex(payload_text, payload_hex, sizeof(payload_hex));
+  return RAK_SendHexPayload(port, payload_hex);
+}
+
+static bool BuildPayloadPart1(uint8_t *payload, uint16_t payload_size)
+{
+  const float values[] = {
+    rms_voltage[0], rms_voltage[1], rms_voltage[2],
+    rms_current[0], rms_current[1], rms_current[2],
+    revolutions
+  };
+
+  if (payload_size < RAK_PART1_PAYLOAD_SIZE)
+  {
+    return false;
+  }
+
+  payload[0] = 1U;
+  for (uint8_t i = 0; i < 7U; i++)
+  {
+    float value = values[i];
+    uint16_t scaled;
+
+    if (value < 0.0f)
+    {
+      value = 0.0f;
+    }
+    if (value > 655.35f)
+    {
+      value = 655.35f;
+    }
+
+    scaled = (uint16_t)((value * 100.0f) + 0.5f);
+    payload[1U + (i * 2U)] = (uint8_t)(scaled & 0xFFU);
+    payload[2U + (i * 2U)] = (uint8_t)(scaled >> 8);
+  }
 
   return true;
 }
