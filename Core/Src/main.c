@@ -2953,7 +2953,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  Debug_Log("\r\n[BOOT] vetr_srt1.0 start\r\n");
+  Debug_Log("\r\n[BOOT] wind start\r\n");
   Debug_Log("[BOOT] SystemClock configured before GPIO/UART init: SYSCLK=%lu HCLK=%lu PCLK1=%lu PCLK2=%lu\r\n",
             HAL_RCC_GetSysClockFreq(), HAL_RCC_GetHCLKFreq(),
             HAL_RCC_GetPCLK1Freq(), HAL_RCC_GetPCLK2Freq());

@@ -1,0 +1,51 @@
+name: Firmware CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install ARM toolchain and Ninja
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi ninja-build
+
+      - name: Build host scenarios
+        run: >-
+          gcc -std=c11 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror
+          -I Core/Inc tests/app_logic_scenarios.c Core/Src/app_logic.c
+          -o build-app-logic-tests
+
+      - name: Run host scenarios
+        run: ./build-app-logic-tests
+
+      - name: Verify firmware invariants
+        shell: pwsh
+        run: ./tests/verify_firmware_invariants.ps1
+
+      - name: Configure release firmware
+        run: cmake --preset release
+
+      - name: Build release firmware
+        run: cmake --build --preset release
+
+      - name: Upload release images
+        uses: actions/upload-artifact@v4
+        with:
+          name: wind-firmware
+          path: |
+            build/release/wind.elf
+            build/release/wind.hex
+            build/release/wind.bin
+            build/release/wind.map
+          if-no-files-found: error

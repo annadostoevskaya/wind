@@ -1,0 +1,39 @@
+# STM32CubeIDE and CMake build output
+/Debug/
+/Release/
+/build/
+/cmake-build-*/
+
+# Compiler, linker and analysis artifacts
+*.o
+*.obj
+*.d
+*.su
+*.cyclo
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.srec
+
+# Test and tooling output
+/tmp/
+/tests/*.exe
+/tests/*.out
+__pycache__/
+*.py[cod]
+
+# IDE, editor and OS-local files
+/.vscode/
+/.idea/
+/.metadata/
+/RemoteSystemsTempFiles/
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

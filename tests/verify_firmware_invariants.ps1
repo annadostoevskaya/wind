@@ -688,7 +688,7 @@ $paths = [ordered]@{
     Interrupts = 'Core/Src/stm32f4xx_it.c'
     InterruptHeader = 'Core/Inc/stm32f4xx_it.h'
     Startup    = 'Core/Startup/startup_stm32f407vgtx.s'
-    Ioc        = 'vetr_srt1.0.ioc'
+    Ioc        = 'wind.ioc'
     Decoder    = 'chirpstack_decoder.js'
 }
 
@@ -700,7 +700,12 @@ $baselineMsp = Get-HeadFile -Repository $repositoryRoot -Path $paths.Msp
 $finalMsp = Get-CurrentFile -Repository $repositoryRoot -Path $paths.Msp
 $baselineInterrupts = Get-HeadFile -Repository $repositoryRoot -Path $paths.Interrupts
 $finalInterrupts = Get-CurrentFile -Repository $repositoryRoot -Path $paths.Interrupts
-$baselineIoc = Get-HeadFile -Repository $repositoryRoot -Path $paths.Ioc
+$headIocPaths = @(& git -c ("safe.directory={0}" -f $repositoryRoot) -C $repositoryRoot ls-tree -r --name-only HEAD 2>&1 |
+    Where-Object { $_ -match '\.ioc$' })
+if (($LASTEXITCODE -ne 0) -or ($headIocPaths.Count -ne 1)) {
+    throw 'Expected exactly one .ioc file in git HEAD'
+}
+$baselineIoc = Get-HeadFile -Repository $repositoryRoot -Path $headIocPaths[0]
 $finalIoc = Get-CurrentFile -Repository $repositoryRoot -Path $paths.Ioc
 $baselineDecoder = Get-HeadFile -Repository $repositoryRoot -Path $paths.Decoder
 $finalDecoder = Get-CurrentFile -Repository $repositoryRoot -Path $paths.Decoder
@@ -752,6 +757,9 @@ $iocExpected = [ordered]@{
     'Mcu.Pin29' = 'PD5'
     'Mcu.Pin30' = 'PD6'
     'Mcu.PinsNb' = '31'
+    'ProjectManager.ProjectFileName' = 'wind.ioc'
+    'ProjectManager.ProjectName' = 'wind'
+    'ProjectManager.StackSize' = '0x1000'
 }
 $iocActual = [ordered]@{}
 for ($rank = 1; $rank -le 6; $rank++) {
@@ -970,9 +978,12 @@ $rotationMask = Get-CFunctionText -Text $finalMain -Name 'Rotation_SetExtiEnable
 $allCoreC = ((Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'Core\Src') -Filter '*.c' -File | ForEach-Object {
     Get-Content -LiteralPath $_.FullName -Raw
 }) -join "`n")
-$debugMakefile = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Debug\makefile') -Raw
-$debugCoreRules = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Debug\Core\Src\subdir.mk') -Raw
-$debugHalRules = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Debug\Drivers\STM32F4xx_HAL_Driver\Src\subdir.mk') -Raw
+$cmakeLists = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CMakeLists.txt') -Raw
+$cmakePresets = Get-Content -LiteralPath (Join-Path $repositoryRoot 'CMakePresets.json') -Raw
+$cmakeToolchain = Get-Content -LiteralPath (Join-Path $repositoryRoot 'cmake\arm-none-eabi-gcc.cmake') -Raw
+$ciWorkflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github\workflows\firmware-ci.yml') -Raw
+$eclipseProject = Get-Content -LiteralPath (Join-Path $repositoryRoot '.project') -Raw
+$debugLaunch = Get-Content -LiteralPath (Join-Path $repositoryRoot 'wind-debug.launch') -Raw
 $flashLinker = Get-Content -LiteralPath (Join-Path $repositoryRoot 'STM32F407VGTX_FLASH.ld') -Raw
 $ramLinker = Get-Content -LiteralPath (Join-Path $repositoryRoot 'STM32F407VGTX_RAM.ld') -Raw
 
@@ -994,8 +1005,11 @@ $integrationChecks = [ordered]@{
     'EU868 SF12-safe uplink default is at least 300000 ms' = ([uint32](Normalize-CIntegerToken (Get-DefineValue -Text $finalMain -Name 'UPLINK_PERIOD_MS' -Context 'working main.c')) -ge 300000)
     'UART ring power-of-two static assertion is present' = [regex]::IsMatch($finalMain, '_Static_assert\s*\(\s*\(RAK_RX_RING_SIZE\s*&\s*\(RAK_RX_RING_SIZE\s*-\s*1U\)\)\s*==\s*0U')
     'PWR_OFF emergency sequence remains high/low one second' = [regex]::IsMatch($finalMain, 'HAL_GPIO_WritePin\(PWR_OFF_GPIO_Port,\s*PWR_OFF_Pin,\s*GPIO_PIN_SET\).*?HAL_Delay\(1000U\).*?HAL_GPIO_WritePin\(PWR_OFF_GPIO_Port,\s*PWR_OFF_Pin,\s*GPIO_PIN_RESET\).*?HAL_Delay\(1000U\)', 'Singleline')
-    'generated makefile uses the project linker script' = [regex]::IsMatch($debugMakefile, '-T"\.\./STM32F407VGTX_FLASH\.ld"') -and (-not [regex]::IsMatch($debugMakefile, 'C:\\Users\\Public\\Documents\\stm32_project'))
-    'official ARM GCC rules keep stack reports without CubeIDE cyclomatic flag' = [regex]::IsMatch($debugCoreRules, '-fstack-usage') -and [regex]::IsMatch($debugHalRules, '-fstack-usage') -and (-not [regex]::IsMatch(($debugCoreRules + $debugHalRules), '-fcyclomatic-complexity|%\.cyclo'))
+    'project identity is consistently wind' = [regex]::IsMatch($eclipseProject, '<name>wind</name>') -and [regex]::IsMatch($finalIoc, 'ProjectManager\.ProjectName=wind') -and [regex]::IsMatch($debugLaunch, 'Debug/wind\.elf')
+    'CMake builds wind ELF, HEX and BIN with the project linker script' = [regex]::IsMatch($cmakeLists, 'project\(wind\s+LANGUAGES\s+C\s+ASM\)') -and [regex]::IsMatch($cmakeLists, '-T\$\{CMAKE_SOURCE_DIR\}/STM32F407VGTX_FLASH\.ld') -and [regex]::IsMatch($cmakeLists, 'wind\.hex') -and [regex]::IsMatch($cmakeLists, 'wind\.bin')
+    'CMake presets provide warning-clean Debug and Release builds' = [regex]::IsMatch($cmakePresets, '"name"\s*:\s*"debug"') -and [regex]::IsMatch($cmakePresets, '"name"\s*:\s*"release"') -and [regex]::IsMatch($cmakePresets, '"WIND_WARNINGS_AS_ERRORS"\s*:\s*"ON"')
+    'official ARM GCC toolchain keeps stack usage reports' = [regex]::IsMatch($cmakeToolchain, 'arm-none-eabi-gcc') -and [regex]::IsMatch($cmakeLists, '-fstack-usage') -and (-not [regex]::IsMatch($cmakeLists, '-fcyclomatic-complexity'))
+    'CI runs scenarios, invariants and the release build' = [regex]::IsMatch($ciWorkflow, 'Run host scenarios') -and [regex]::IsMatch($ciWorkflow, 'verify_firmware_invariants\.ps1') -and [regex]::IsMatch($ciWorkflow, 'cmake --build --preset release')
     'both linker scripts reserve at least four KiB for stack' = [regex]::IsMatch($flashLinker, '_Min_Stack_Size\s*=\s*0x1000') -and [regex]::IsMatch($ramLinker, '_Min_Stack_Size\s*=\s*0x1000')
 }
 $integrationRows = @()
@@ -1072,5 +1086,5 @@ if ($script:Failures.Count -gt 0) {
     exit 1
 }
 
-Write-Host 'PASS: all protected firmware hardware, measurement and packet invariants match git HEAD.'
+Write-Host 'PASS: firmware hardware, measurement, packet and production-build invariants are satisfied.'
 exit 0
