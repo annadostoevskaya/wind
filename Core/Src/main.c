@@ -158,7 +158,12 @@ typedef struct
 #define RAK_POWER_OFF_DELAY_MS  500U
 #define RAK_UART_TX_TIMEOUT_MS  25U
 
+/* Safe default for a 33-byte EU868 uplink when the modem may use SF12.
+   A product build may override this value only when its known data rate and
+   regional duty-cycle policy justify a different interval. */
+#ifndef UPLINK_PERIOD_MS
 #define UPLINK_PERIOD_MS        300000U
+#endif
 #define UPLINK_RESULT_TIMEOUT_MS 30000U
 #define UPLINK_BUSY_RETRY_MS    60000U
 #define UPLINK_MAX_NETWORK_FAILURES 3U
@@ -327,6 +332,7 @@ static uint32_t App_GetTim2ClockHz(void);
 static void App_LogSamplingConfiguration(void);
 
 static bool App_StartMeasurements(uint32_t now);
+static bool App_RestartAdcAcquisition(void);
 static void App_StopMeasurements(void);
 static void App_EnableMeasurementClocks(void);
 static void App_DisableMeasurementClocks(void);
@@ -1063,6 +1069,7 @@ static void App_CalculateRmsWindow(void)
   }
 
   rms_valid = true;
+  device_status_flags &= (uint8_t)~STATUS_ADC_WINDOW_ERROR;
 }
 
 static void App_ProcessAdcBlock(uint16_t offset)
@@ -1112,6 +1119,47 @@ static bool App_AdcGenerationStable(uint32_t generation)
   return stable;
 }
 
+static bool App_RestartAdcAcquisition(void)
+{
+  uint32_t primask;
+
+  /* Preserve the independent rotation window.  Only the corrupted ADC/RMS
+     acquisition is restarted after a hardware/DMA error. */
+  measurements_running = false;
+  HAL_NVIC_DisableIRQ(DMA2_Stream0_IRQn);
+  (void)HAL_TIM_Base_Stop(&htim2);
+  (void)HAL_ADC_Stop_DMA(&hadc1);
+  __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
+
+  primask = Critical_Enter();
+  adc_dma_pending_mask = 0U;
+  adc_dma_overrun = 0U;
+  adc_dma_error = 0U;
+  adc_dma_generation = 0U;
+  Critical_Exit(primask);
+  HAL_NVIC_ClearPendingIRQ(DMA2_Stream0_IRQn);
+
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)(void *)adc_buffer,
+                        ADC_DMA_BUFFER_VALUES) != HAL_OK)
+  {
+    Debug_Log("[MEAS] ADC/DMA recovery start failed, err=0x%08lX\r\n",
+              HAL_ADC_GetError(&hadc1));
+    return false;
+  }
+
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
+  {
+    HAL_NVIC_DisableIRQ(DMA2_Stream0_IRQn);
+    (void)HAL_ADC_Stop_DMA(&hadc1);
+    Debug_Log("[MEAS] TIM2 recovery start failed\r\n");
+    return false;
+  }
+
+  measurements_running = true;
+  return true;
+}
+
 static void App_ProcessAdcDma(void)
 {
   AppLogicAdcBlockAction action;
@@ -1154,7 +1202,7 @@ static void App_ProcessAdcDma(void)
   {
     if (error != 0U)
     {
-      Debug_Log("[MEAS] ADC/DMA error; discard window and restart same resources\r\n");
+      Debug_Log("[MEAS] ADC/DMA error; discard only RMS window and restart acquisition\r\n");
     }
     else if (overrun != 0U)
     {
@@ -1170,7 +1218,7 @@ static void App_ProcessAdcDma(void)
 
     if (error != 0U)
     {
-      if (!App_StartMeasurements(HAL_GetTick()))
+      if (!App_RestartAdcAcquisition())
       {
         App_RequestReconnect(HAL_GetTick(), "ADC restart failed");
       }
@@ -1238,6 +1286,9 @@ static void Battery_Start(BatteryReason reason, uint32_t now)
   }
 
   battery_request = reason;
+  /* Project history powers the ADC2_IN3 battery divider/detector through
+     ON_PWR_DET.  No schematic is stored in this repository, so preserve that
+     established board mapping rather than guessing ON_AX or ON_AN. */
   HAL_GPIO_WritePin(ON_PWR_DET_GPIO_Port, ON_PWR_DET_Pin, GPIO_PIN_SET);
   battery_deadline = now + BATTERY_SETTLE_MS;
   Debug_Log("[BAT] measurement requested, reason=%u, settle=%lu ms\r\n",
@@ -1484,14 +1535,21 @@ static void App_EnterStopCycle(void)
     __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
     /* PB12 can latch again after the earlier shutdown clear.  Make the final
        line-only clear atomic with WFI without touching other EXTI10..15 lines.
-       A masked interrupt still wakes WFI; it is serviced after PRIMASK restore. */
+       Any other enabled interrupt may still wake WFI and is serviced after
+       PRIMASK is restored. */
     stop_primask = Critical_Enter();
     EXTI->PR = (uint32_t)Freqency_Pin;
     __DSB();
     HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
     Critical_Exit(stop_primask);
-    /* Resume the HAL time base first so HSE/PLL startup timeouts remain live.
-       HAL_RCC_ClockConfig then rebuilds SysTick for the restored clock. */
+    /* STOP selects HSI as SYSCLK.  Rebuild a temporary 16 MHz HAL time base
+       before waiting for HSE/PLL, then rebuild the final 72 MHz time base.
+       Using the stale pre-STOP SysTick reload would shorten RCC timeouts. */
+    SystemCoreClockUpdate();
+    if (HAL_InitTick(TICK_INT_PRIORITY) != HAL_OK)
+    {
+      Error_Handler();
+    }
     HAL_ResumeTick();
     SystemClock_Config();
     SystemCoreClockUpdate();
@@ -1499,6 +1557,7 @@ static void App_EnterStopCycle(void)
     {
       Error_Handler();
     }
+    HAL_ResumeTick();
     DWT_Delay_Init();
     RTC_WakeupStop();
   }

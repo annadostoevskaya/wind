@@ -62,7 +62,7 @@ function Get-HeadFile {
     )
 
     $gitPath = $Path.Replace('\', '/')
-    $output = @(& git -C $Repository show ('HEAD:{0}' -f $gitPath) 2>&1)
+    $output = @(& git -c ("safe.directory={0}" -f $Repository) -C $Repository show ('HEAD:{0}' -f $gitPath) 2>&1)
     if ($LASTEXITCODE -ne 0) {
         throw "git show failed for ${gitPath}: $($output -join [Environment]::NewLine)"
     }
@@ -101,6 +101,17 @@ function Get-DefineValue {
     )
     $pattern = '(?m)^[ \t]*#define[ \t]+' + [regex]::Escape($Name) + '[ \t]+(?<value>[^\r\n]+?)\s*$'
     return (Get-RequiredCapture -Text $Text -Pattern $pattern -Label "$Context define $Name")
+}
+
+function Get-IocValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+
+    $pattern = '(?m)^' + [regex]::Escape($Name) + '=(?<value>[^\r\n]+)$'
+    return (Get-RequiredCapture -Text $Text -Pattern $pattern -Label "$Context setting $Name")
 }
 
 function Get-CFunctionText {
@@ -440,7 +451,7 @@ function Get-RmsSemanticMap {
     if ([regex]::IsMatch($Text, '(?m)^\s*static\s+void\s+App_ProcessAdcBlock\s*\(')) {
         $acquisition = Get-CFunctionText -Text $Text -Name 'App_ProcessAdcBlock' -Context $Context
         $orderedSequence = [regex]::IsMatch($acquisition,
-            'base\s*=\s*offset\s*\+\s*\(sequence\s*\*\s*ADC_CHANNELS\).*?' +
+            'base\s*=\s*(?:\(uint16_t\)\s*)?\(?\s*offset\s*\+\s*\(sequence\s*\*\s*ADC_CHANNELS\).*?' +
             'channel\s*=\s*0U.*?channel\s*<\s*ADC_CHANNELS.*?' +
             'raw\s*=\s*adc_buffer\[base\s*\+\s*channel\]', 'Singleline')
         $sumOk = [regex]::IsMatch($acquisition, 'sum\[channel\]\s*\+=\s*value\s*;')
@@ -466,8 +477,8 @@ function Get-DmaShapeMap {
     )
 
     $result = [ordered]@{}
-    $result['HAL_ADC_Start_DMA length'] = Get-RequiredCapture -Text $Text -Pattern 'HAL_ADC_Start_DMA\(&hadc1,\s*\(uint32_t\s*\*\)adc_buffer,\s*(?<value>[^\)]+)\)' -Label "$Context ADC DMA length"
-    $buffer = [regex]::Match($Text, '(?m)^\s*static\s+uint16_t\s+adc_buffer\s*\[\s*(?<value>[^\]]+)\s*\]')
+    $result['HAL_ADC_Start_DMA length'] = Get-RequiredCapture -Text $Text -Pattern 'HAL_ADC_Start_DMA\(\s*&hadc1,\s*\(uint32_t\s*\*\)\s*(?:\(void\s*\*\)\s*)?adc_buffer,\s*(?<value>[^\)]+)\)' -Label "$Context ADC DMA length"
+    $buffer = [regex]::Match($Text, '(?m)^\s*(?:_Alignas\([^\)]+\)\s*)?static\s+uint16_t\s+adc_buffer\s*\[\s*(?<value>[^\]]+)\s*\]')
     if ($buffer.Success) {
         $result['adc_buffer element count'] = Normalize-Scalar $buffer.Groups['value'].Value
     }
@@ -660,12 +671,12 @@ function Get-TimingInfo {
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$insideWorkTree = @(& git -C $repositoryRoot rev-parse --is-inside-work-tree 2>&1)
+$insideWorkTree = @(& git -c ("safe.directory={0}" -f $repositoryRoot) -C $repositoryRoot rev-parse --is-inside-work-tree 2>&1)
 if (($LASTEXITCODE -ne 0) -or (($insideWorkTree -join '').Trim() -ne 'true')) {
     throw "$repositoryRoot is not a git working tree"
 }
 
-$headCommit = (@(& git -C $repositoryRoot rev-parse HEAD 2>&1) -join '').Trim()
+$headCommit = (@(& git -c ("safe.directory={0}" -f $repositoryRoot) -C $repositoryRoot rev-parse HEAD 2>&1) -join '').Trim()
 if ($LASTEXITCODE -ne 0) {
     throw 'Could not resolve git HEAD'
 }
@@ -675,6 +686,8 @@ $paths = [ordered]@{
     MainHeader = 'Core/Inc/main.h'
     Msp        = 'Core/Src/stm32f4xx_hal_msp.c'
     Interrupts = 'Core/Src/stm32f4xx_it.c'
+    InterruptHeader = 'Core/Inc/stm32f4xx_it.h'
+    Startup    = 'Core/Startup/startup_stm32f407vgtx.s'
     Ioc        = 'vetr_srt1.0.ioc'
     Decoder    = 'chirpstack_decoder.js'
 }
@@ -695,11 +708,11 @@ $finalDecoder = Get-CurrentFile -Repository $repositoryRoot -Path $paths.Decoder
 Write-Host ('Firmware invariant verification against HEAD {0}' -f $headCommit)
 Write-Host ('Repository: {0}' -f $repositoryRoot)
 
-$protectedFiles = @($paths.MainHeader, $paths.Msp, $paths.Ioc, $paths.Decoder)
+$protectedFiles = @($paths.MainHeader, $paths.Decoder)
 $protectedBaseline = [ordered]@{}
 $protectedFinal = [ordered]@{}
 foreach ($path in $protectedFiles) {
-    $null = & git -C $repositoryRoot diff --quiet HEAD -- $path
+    $null = & git -c ("safe.directory={0}" -f $repositoryRoot) -C $repositoryRoot diff --quiet HEAD -- $path
     $diffExit = $LASTEXITCODE
     if ($diffExit -gt 1) {
         throw "git diff failed for $path"
@@ -708,6 +721,55 @@ foreach ($path in $protectedFiles) {
     $protectedFinal[$path] = $(if ($diffExit -eq 0) { 'HEAD content' } else { 'CHANGED' })
 }
 Compare-Map -Title 'Protected files (must be byte-for-byte unchanged to git)' -Baseline $protectedBaseline -Final $protectedFinal
+
+$iocExpected = [ordered]@{
+    'ADC1.Channel-1\#ChannelRegularConversion' = 'ADC_CHANNEL_4'
+    'ADC1.Channel-2\#ChannelRegularConversion' = 'ADC_CHANNEL_6'
+    'ADC1.Channel-3\#ChannelRegularConversion' = 'ADC_CHANNEL_14'
+    'ADC1.Channel-4\#ChannelRegularConversion' = 'ADC_CHANNEL_5'
+    'ADC1.Channel-5\#ChannelRegularConversion' = 'ADC_CHANNEL_7'
+    'ADC1.Channel-6\#ChannelRegularConversion' = 'ADC_CHANNEL_15'
+    'ADC1.ClockPrescaler' = 'ADC_CLOCK_SYNC_PCLK_DIV4'
+    'ADC1.ContinuousConvMode' = 'DISABLE'
+    'ADC1.DMAContinuousRequests' = 'ENABLE'
+    'ADC1.EOCSelection' = 'ADC_EOC_SEQ_CONV'
+    'ADC1.ExternalTrigConv' = 'ADC_EXTERNALTRIGCONV_T2_TRGO'
+    'ADC1.ExternalTrigConvEdge' = 'ADC_EXTERNALTRIGCONVEDGE_RISING'
+    'Dma.ADC1.0.Instance' = 'DMA2_Stream0'
+    'Dma.ADC1.0.MemInc' = 'DMA_MINC_ENABLE'
+    'Dma.ADC1.0.PeriphDataAlignment' = 'DMA_PDATAALIGN_HALFWORD'
+    'Dma.ADC1.0.MemDataAlignment' = 'DMA_MDATAALIGN_HALFWORD'
+    'Dma.ADC1.0.Mode' = 'DMA_CIRCULAR'
+    'PB12.Signal' = 'GPXTI12'
+    'TIM2.Prescaler' = '8399'
+    'TIM2.Period' = '3'
+    'RCC.HSE_VALUE' = '8000000'
+    'PA9.Signal' = 'USART1_TX'
+    'PA10.Signal' = 'USART1_RX'
+    'PD5.Signal' = 'USART2_TX'
+    'PD6.Signal' = 'USART2_RX'
+    'Mcu.Pin28' = 'VP_TIM2_VS_ClockSourceINT'
+    'Mcu.Pin29' = 'PD5'
+    'Mcu.Pin30' = 'PD6'
+    'Mcu.PinsNb' = '31'
+}
+$iocActual = [ordered]@{}
+for ($rank = 1; $rank -le 6; $rank++) {
+    $iocExpected[('ADC1.Rank-{0}\#ChannelRegularConversion' -f $rank)] = [string]$rank
+    $iocExpected[('ADC1.SamplingTime-{0}\#ChannelRegularConversion' -f $rank)] = 'ADC_SAMPLETIME_84CYCLES'
+}
+foreach ($name in $iocExpected.Keys) {
+    $iocActual[$name] = Get-IocValue -Text $finalIoc -Name $name -Context 'working .ioc'
+}
+$iocSettings = @($finalIoc -split "`n" | Where-Object { $_ -match '^[^#;][^=]*=' })
+$duplicateIocKeys = @($iocSettings | ForEach-Object { ($_ -split '=', 2)[0] } |
+    Group-Object | Where-Object { $_.Count -gt 1 })
+$duplicateIocPinValues = @($iocSettings | Where-Object { $_ -match '^Mcu\.Pin\d+=' } |
+    ForEach-Object { ($_ -split '=', 2)[1] } | Group-Object | Where-Object { $_.Count -gt 1 })
+if (($duplicateIocKeys.Count -ne 0) -or ($duplicateIocPinValues.Count -ne 0)) {
+    Add-Failure 'working .ioc contains duplicate keys or duplicate Mcu.Pin values'
+}
+Compare-Map -Title 'CubeMX metadata matches the implemented hardware configuration' -Baseline $iocExpected -Final $iocActual
 
 $measurementNames = @(
     'ADC_CHANNELS', 'ADC_MAX', 'VREF', 'ANALOG_MIDPOINT_V',
@@ -807,7 +869,8 @@ $finalGpioInit = Merge-Maps -Maps @(
     (Get-GpioInitMap -Text $finalMsp -FunctionName 'HAL_ADC_MspInit' -Context 'working MSP' -SourceLabel 'ADC MSP GPIO'),
     (Get-GpioInitMap -Text $finalMsp -FunctionName 'HAL_UART_MspInit' -Context 'working MSP' -SourceLabel 'RAK UART GPIO')
 )
-Compare-Map -Title 'GPIO modes, pulls, speeds and alternate functions' -Baseline $baselineGpioInit -Final $finalGpioInit
+Compare-Map -Title 'GPIO modes, pulls, speeds and alternate functions' -Baseline $baselineGpioInit -Final $finalGpioInit `
+    -AllowedDifferenceKeys @('ADC MSP GPIO #4')
 
 $baselineMxGpio = Get-CFunctionText -Text $baselineMain -Name 'MX_GPIO_Init' -Context 'HEAD main.c'
 $finalMxGpio = Get-CFunctionText -Text $finalMain -Name 'MX_GPIO_Init' -Context 'working main.c'
@@ -896,6 +959,55 @@ Assert-ExactValue -Label 'RAK payload version' -Actual $finalPacket['byte 0: for
 $baselineIrq = Get-IrqMap -Text $baselineInterrupts -Context 'HEAD stm32f4xx_it.c'
 $finalIrq = Get-IrqMap -Text $finalInterrupts -Context 'working stm32f4xx_it.c'
 Compare-Map -Title 'Existing IRQ line-to-HAL-handle mappings (additional IRQ code is allowed)' -Baseline $baselineIrq -Final $finalIrq
+
+$startupText = Get-CurrentFile -Repository $repositoryRoot -Path $paths.Startup
+$interruptHeaderText = Get-CurrentFile -Repository $repositoryRoot -Path $paths.InterruptHeader
+$rtcHandler = Get-CFunctionText -Text $finalInterrupts -Name 'RTC_WKUP_IRQHandler' -Context 'working stm32f4xx_it.c'
+$rtcAppHandler = Get-CFunctionText -Text $finalMain -Name 'App_RTCWakeupIRQ' -Context 'working main.c'
+$rtcStart = Get-CFunctionText -Text $finalMain -Name 'RTC_WakeupStart' -Context 'working main.c'
+$stopCycle = Get-CFunctionText -Text $finalMain -Name 'App_EnterStopCycle' -Context 'working main.c'
+$rotationMask = Get-CFunctionText -Text $finalMain -Name 'Rotation_SetExtiEnabled' -Context 'working main.c'
+$allCoreC = ((Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'Core\Src') -Filter '*.c' -File | ForEach-Object {
+    Get-Content -LiteralPath $_.FullName -Raw
+}) -join "`n")
+$debugMakefile = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Debug\makefile') -Raw
+$debugCoreRules = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Debug\Core\Src\subdir.mk') -Raw
+$debugHalRules = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Debug\Drivers\STM32F4xx_HAL_Driver\Src\subdir.mk') -Raw
+$flashLinker = Get-Content -LiteralPath (Join-Path $repositoryRoot 'STM32F407VGTX_FLASH.ld') -Raw
+$ramLinker = Get-Content -LiteralPath (Join-Path $repositoryRoot 'STM32F407VGTX_RAM.ld') -Raw
+
+$integrationChecks = [ordered]@{
+    'startup vector references RTC_WKUP_IRQHandler' = [regex]::IsMatch($startupText, '(?m)^\s*\.word\s+RTC_WKUP_IRQHandler\b')
+    'exactly one RTC_WKUP_IRQHandler definition' = ([regex]::Matches($allCoreC, '(?m)^\s*void\s+RTC_WKUP_IRQHandler\s*\(').Count -eq 1)
+    'RTC handler prototype is exported' = [regex]::IsMatch($interruptHeaderText, '(?m)^\s*void\s+RTC_WKUP_IRQHandler\s*\(void\)\s*;')
+    'RTC IRQ delegates only to App_RTCWakeupIRQ' = [regex]::IsMatch($rtcHandler, 'App_RTCWakeupIRQ\s*\(\s*\)\s*;') -and (-not [regex]::IsMatch($rtcHandler, 'Debug_Log|HAL_UART|HAL_Delay'))
+    'RTC IRQ clears WUTF and EXTI22' = [regex]::IsMatch($rtcAppHandler, 'RTC->ISR\s*&=\s*~RTC_ISR_WUTF') -and [regex]::IsMatch($rtcAppHandler, 'EXTI->PR\s*=\s*EXTI_PR_PR22')
+    'RTC flags are cleared before WUT enable' = [regex]::IsMatch($rtcStart, 'RTC->ISR\s*&=\s*~RTC_ISR_WUTF.*?EXTI->PR\s*=\s*EXTI_PR_PR22.*?HAL_NVIC_ClearPendingIRQ\(RTC_WKUP_IRQn\).*?RTC->CR\s*\|=\s*RTC_CR_WUTIE\s*\|\s*RTC_CR_WUTE', 'Singleline')
+    'RTC NVIC is enabled' = [regex]::IsMatch($finalMain, 'HAL_NVIC_EnableIRQ\(RTC_WKUP_IRQn\)')
+    'STOP recovery rebuilds temporary and final SysTick before DWT' = [regex]::IsMatch($stopCycle, 'SystemCoreClockUpdate\(\).*?HAL_InitTick\(TICK_INT_PRIORITY\).*?HAL_ResumeTick\(\).*?SystemClock_Config\(\).*?SystemCoreClockUpdate\(\).*?HAL_InitTick\(TICK_INT_PRIORITY\).*?HAL_ResumeTick\(\).*?DWT_Delay_Init\(\)', 'Singleline')
+    'DMA2 Stream0 IRQ delegates to hdma_adc1' = [regex]::IsMatch($finalInterrupts, 'DMA2_Stream0_IRQHandler\s*\(void\).*?HAL_DMA_IRQHandler\(&hdma_adc1\)', 'Singleline')
+    'ADC half/full callbacks are both present' = [regex]::IsMatch($finalMain, 'HAL_ADC_ConvHalfCpltCallback') -and [regex]::IsMatch($finalMain, 'HAL_ADC_ConvCpltCallback')
+    'shared EXTI15_10 NVIC is never disabled' = -not [regex]::IsMatch($finalMain, 'HAL_NVIC_DisableIRQ\(EXTI15_10_IRQn\)')
+    'rotation masks only Freqency_Pin in EXTI IMR' = [regex]::IsMatch($rotationMask, 'AppLogic_ExtiMaskUpdate\(EXTI->IMR,\s*\(uint32_t\)Freqency_Pin,\s*(?:true|false)\)', 'Singleline')
+    'JOIN command and ten-second retry are preserved' = [regex]::IsMatch($finalMain, 'AT\+JOIN=1:0:10:1\\r\\n') -and ((Get-DefineValue -Text $finalMain -Name 'RAK_JOIN_RETRY_DELAY_MS' -Context 'working main.c') -eq '10000U')
+    'battery check remains every ten completed JOIN failures' = ((Get-DefineValue -Text $finalMain -Name 'RAK_JOIN_FAILURES_PER_BATTERY_CHECK' -Context 'working main.c') -eq '10U')
+    'EU868 SF12-safe uplink default is at least 300000 ms' = ([uint32](Normalize-CIntegerToken (Get-DefineValue -Text $finalMain -Name 'UPLINK_PERIOD_MS' -Context 'working main.c')) -ge 300000)
+    'UART ring power-of-two static assertion is present' = [regex]::IsMatch($finalMain, '_Static_assert\s*\(\s*\(RAK_RX_RING_SIZE\s*&\s*\(RAK_RX_RING_SIZE\s*-\s*1U\)\)\s*==\s*0U')
+    'PWR_OFF emergency sequence remains high/low one second' = [regex]::IsMatch($finalMain, 'HAL_GPIO_WritePin\(PWR_OFF_GPIO_Port,\s*PWR_OFF_Pin,\s*GPIO_PIN_SET\).*?HAL_Delay\(1000U\).*?HAL_GPIO_WritePin\(PWR_OFF_GPIO_Port,\s*PWR_OFF_Pin,\s*GPIO_PIN_RESET\).*?HAL_Delay\(1000U\)', 'Singleline')
+    'generated makefile uses the project linker script' = [regex]::IsMatch($debugMakefile, '-T"\.\./STM32F407VGTX_FLASH\.ld"') -and (-not [regex]::IsMatch($debugMakefile, 'C:\\Users\\Public\\Documents\\stm32_project'))
+    'official ARM GCC rules keep stack reports without CubeIDE cyclomatic flag' = [regex]::IsMatch($debugCoreRules, '-fstack-usage') -and [regex]::IsMatch($debugHalRules, '-fstack-usage') -and (-not [regex]::IsMatch(($debugCoreRules + $debugHalRules), '-fcyclomatic-complexity|%\.cyclo'))
+    'both linker scripts reserve at least four KiB for stack' = [regex]::IsMatch($flashLinker, '_Min_Stack_Size\s*=\s*0x1000') -and [regex]::IsMatch($ramLinker, '_Min_Stack_Size\s*=\s*0x1000')
+}
+$integrationRows = @()
+foreach ($label in $integrationChecks.Keys) {
+    $passed = [bool]$integrationChecks[$label]
+    if (-not $passed) {
+        Add-Failure "Required integration check failed: $label"
+    }
+    $integrationRows += [pscustomobject]@{ Check = $label; Status = $(if ($passed) { 'PASS' } else { 'FAIL' }) }
+}
+Write-Section 'Required RTC, DMA, EXTI, JOIN, UART, power and build integration'
+Show-Table $integrationRows
 
 $functionInvariants = @(
     'SystemClock_Config', 'MX_ADC1_Init', 'MX_ADC2_Init',

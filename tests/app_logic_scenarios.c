@@ -155,6 +155,23 @@ int main(void)
   require_true(model.joined, "successful JOIN on first attempt");
 
   model = (JoinModel){0U, 0U, false, false};
+  model_join_event(&model, AppLogic_RakClassifyLine("OK"), true, 4.0f);
+  require_true(!model.joined && (model.failed_joins == 0U),
+               "bare OK accepts the command but never completes JOIN");
+
+  model_join_event(&model, AppLogic_RakClassifyLine("AT+NJS:1"),
+                   true, 4.0f);
+  require_true(model.joined,
+               "lost asynchronous JOIN event is recovered by AT+NJS:1");
+
+  model = (JoinModel){0U, 0U, false, false};
+  model_join_event(&model, AppLogic_RakClassifyLine("AT_BUSY_ERROR"),
+                   true, 4.0f);
+  require_true((model.failed_joins == 0U) &&
+               (model.battery_checks == 0U) && !model.joined,
+               "AT_BUSY_ERROR is not a completed radio JOIN failure");
+
+  model = (JoinModel){0U, 0U, false, false};
   for (unsigned int i = 0U; i < 10U; i++)
   {
     model_join_event(&model,
@@ -173,7 +190,8 @@ int main(void)
 
   require_true((AppLogic_RakClassifyLine("OK") == RAK_EVT_OK) &&
                (AppLogic_RakClassifyLine("OKAY") == 0U) &&
-               (AppLogic_RakClassifyLine("NOT_OK") == 0U),
+               (AppLogic_RakClassifyLine("NOT_OK") == 0U) &&
+               (AppLogic_RakClassifyLine(" OK") == 0U),
                "OK is accepted only as an exact complete line");
 
   require_true((AppLogic_RakClassifyLine("+EVT:JOINED") == RAK_EVT_JOINED) &&
@@ -204,17 +222,31 @@ int main(void)
 
   require_true((AppLogic_RakClassifyLine("AT_BUSY_ERROR") == RAK_EVT_BUSY) &&
                (AppLogic_RakClassifyLine("AT_DUTYCYLE_RESTRICTED") ==
+                RAK_EVT_BUSY) &&
+               (AppLogic_RakClassifyLine("AT_DUTYCYCLE_RESTRICTED") ==
                 RAK_EVT_BUSY),
                "BUSY and duty-cycle restriction use non-failure backoff");
   require_true(AppLogic_RakClassifyLine("AT_PARAM_ERROR") ==
                RAK_EVT_PARAM_ERROR,
                "parameter rejection is distinguishable from radio failure");
+  require_true((AppLogic_RakClassifyLine("AT_ERROR") == RAK_EVT_ERROR) &&
+               (AppLogic_RakClassifyLine("AT_RX_ERROR") == RAK_EVT_ERROR) &&
+               (AppLogic_RakClassifyLine("AT_ERROR_EXTRA") == 0U),
+               "AT errors are exact complete-line events");
+  require_true((AppLogic_RakClassifyLine("AT_NO_NETWORK_JOINED") ==
+                RAK_EVT_NO_NETWORK) &&
+               (AppLogic_RakClassifyLine("AT_NO_NETWORK_JOINED_EXTRA") ==
+                0U),
+               "network loss is exact and has no substring false positive");
 
   require_true(AppLogic_RakClassifyLine("+EVT:TX_DONE") == RAK_EVT_SEND_OK,
                "current RUI3 unconfirmed TX_DONE success");
   require_true(AppLogic_RakClassifyLine("+EVT:SEND_CONFIRMED_OK") ==
                RAK_EVT_SEND_OK,
                "current confirmed SEND success");
+  require_true(AppLogic_RakClassifyLine("+EVT:SEND_UNCONFIRMED_OK") ==
+               RAK_EVT_SEND_OK,
+               "current unconfirmed SEND success variant");
   require_true((AppLogic_RakClassifyLine("+EVT:SEND UNCONFIRMED OK") ==
                 RAK_EVT_SEND_OK) &&
                (AppLogic_RakClassifyLine("+EVT: SEND CONFIRMED OK") ==
@@ -226,11 +258,36 @@ int main(void)
   require_true(AppLogic_RakClassifyLine("+EVT: SEND CONFIRMED FAILED") ==
                RAK_EVT_SEND_FAILED,
                "deprecated colon-space SEND failure");
+  {
+    static const char *const send_failures[] = {
+      "+EVT:SEND_CONFIRMED_FAILED",
+      "+EVT:SEND_UNCONFIRMED_FAILED:4",
+      "+EVT:SEND_CONFIRMED_ERROR,4",
+      "+EVT:SEND_UNCONFIRMED_ERROR 4",
+      "+EVT:SEND_FAILED",
+      "+EVT:SEND_ERROR",
+      "+EVT:TX_FAILED",
+      "+EVT:TX_TIMEOUT"
+    };
+    bool all_send_failures_classified = true;
+
+    for (size_t i = 0U;
+         i < (sizeof(send_failures) / sizeof(send_failures[0])); i++)
+    {
+      if (AppLogic_RakClassifyLine(send_failures[i]) != RAK_EVT_SEND_FAILED)
+      {
+        all_send_failures_classified = false;
+      }
+    }
+    require_true(all_send_failures_classified,
+                 "all supported final SEND failure families are classified");
+  }
   require_true((AppLogic_RakClassifyLine("+EVT:TX_DONE_EXTRA") == 0U) &&
                (AppLogic_RakClassifyLine(
                   "+EVT:SEND_UNCONFIRMED_FAILEDISH") == 0U) &&
                (AppLogic_RakClassifyLine(
-                  "PREFIX_AT_NO_NETWORK_JOINED") == 0U),
+                  "PREFIX_AT_NO_NETWORK_JOINED") == 0U) &&
+               (AppLogic_RakClassifyLine("AT+NJS:10") == 0U),
                "similar SEND/network lines are not false events");
 
   {
@@ -371,6 +428,9 @@ int main(void)
                 RAK_EVT_NO_NETWORK) &&
                AppLogic_ShouldReconnect(true, 1U, 3U),
                "LoRaWAN membership loss triggers reconnect");
+  require_true(!AppLogic_ShouldReconnect(false, 2U, 3U) &&
+               AppLogic_ShouldReconnect(false, 3U, 3U),
+               "uplink reconnect threshold changes only on counted failures");
   require_true(AppLogic_DeadlineReached(30000U, 30000U) &&
                !AppLogic_UplinkFailureIsCurrent(false),
                "deadlines and late SEND failure accounting remain stable");

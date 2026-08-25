@@ -63,8 +63,8 @@ all: main-build
 main-build: vetr_srt1.0.elf secondary-outputs
 
 # Tool invocations
-vetr_srt1.0.elf vetr_srt1.0.map: $(OBJS) $(USER_OBJS) C:\Users\Public\Documents\stm32_project\vetr_srt1.0\STM32F407VGTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "vetr_srt1.0.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\Public\Documents\stm32_project\vetr_srt1.0\STM32F407VGTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="vetr_srt1.0.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+vetr_srt1.0.elf vetr_srt1.0.map: $(OBJS) $(USER_OBJS) ../STM32F407VGTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "vetr_srt1.0.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"../STM32F407VGTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="vetr_srt1.0.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

@@ -148,24 +148,16 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* hadc)
     __HAL_RCC_ADC2_CLK_ENABLE();
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_GPIOC_CLK_ENABLE();
     /**ADC2 GPIO Configuration
     PA0-WKUP     ------> ADC2_IN0
     PA1     ------> ADC2_IN1
     PA2     ------> ADC2_IN2
     PA3     ------> ADC2_IN3
-    PC4     ------> ADC2_IN14
-    PC5     ------> ADC2_IN15
     */
     GPIO_InitStruct.Pin = Z_Pin|Y_Pin|X_Pin|FIVEV_AN_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-    GPIO_InitStruct.Pin = V_C_Pin|I_C_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* USER CODE BEGIN ADC2_MspInit 1 */
 
@@ -221,12 +213,8 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* hadc)
     PA1     ------> ADC2_IN1
     PA2     ------> ADC2_IN2
     PA3     ------> ADC2_IN3
-    PC4     ------> ADC2_IN14
-    PC5     ------> ADC2_IN15
     */
     HAL_GPIO_DeInit(GPIOA, Z_Pin|Y_Pin|X_Pin|FIVEV_AN_Pin);
-
-    HAL_GPIO_DeInit(GPIOC, V_C_Pin|I_C_Pin);
 
   /* USER CODE BEGIN ADC2_MspDeInit 1 */
 
