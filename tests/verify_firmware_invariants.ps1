@@ -975,6 +975,9 @@ $rtcAppHandler = Get-CFunctionText -Text $finalMain -Name 'App_RTCWakeupIRQ' -Co
 $rtcStart = Get-CFunctionText -Text $finalMain -Name 'RTC_WakeupStart' -Context 'working main.c'
 $stopCycle = Get-CFunctionText -Text $finalMain -Name 'App_EnterStopCycle' -Context 'working main.c'
 $rotationMask = Get-CFunctionText -Text $finalMain -Name 'Rotation_SetExtiEnabled' -Context 'working main.c'
+$joinHandler = Get-CFunctionText -Text $finalMain -Name 'RAK_HandleJoin' -Context 'working main.c'
+$uplinkFailureHandler = Get-CFunctionText -Text $finalMain -Name 'RAK_CompleteUplinkFailure' -Context 'working main.c'
+$batteryCompletionHandler = Get-CFunctionText -Text $finalMain -Name 'Battery_HandleCompleted' -Context 'working main.c'
 $allCoreC = ((Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'Core\Src') -Filter '*.c' -File | ForEach-Object {
     Get-Content -LiteralPath $_.FullName -Raw
 }) -join "`n")
@@ -1000,9 +1003,15 @@ $integrationChecks = [ordered]@{
     'ADC half/full callbacks are both present' = [regex]::IsMatch($finalMain, 'HAL_ADC_ConvHalfCpltCallback') -and [regex]::IsMatch($finalMain, 'HAL_ADC_ConvCpltCallback')
     'shared EXTI15_10 NVIC is never disabled' = -not [regex]::IsMatch($finalMain, 'HAL_NVIC_DisableIRQ\(EXTI15_10_IRQn\)')
     'rotation masks only Freqency_Pin in EXTI IMR' = [regex]::IsMatch($rotationMask, 'AppLogic_ExtiMaskUpdate\(EXTI->IMR,\s*\(uint32_t\)Freqency_Pin,\s*(?:true|false)\)', 'Singleline')
-    'JOIN command and ten-second retry are preserved' = [regex]::IsMatch($finalMain, 'AT\+JOIN=1:0:10:1\\r\\n') -and ((Get-DefineValue -Text $finalMain -Name 'RAK_JOIN_RETRY_DELAY_MS' -Context 'working main.c') -eq '10000U')
+    'JOIN uses max RAK attempts and an unlimited STM32 retry loop' = [regex]::IsMatch($finalMain, 'AT\+JOIN=1:1:10:255\\r\\n') -and ((Get-DefineValue -Text $finalMain -Name 'RAK_JOIN_RETRY_DELAY_MS' -Context 'working main.c') -eq '10000U')
+    'only the exact JOINED helper gates ACTIVE mode' = [regex]::IsMatch($joinHandler, 'if\s*\(AppLogic_JoinConfirmed\(events\)\)')
+    'RAK receives a full power cycle after an uplink failure' = [regex]::IsMatch($uplinkFailureHandler, 'App_RequestReconnect\(now,\s*reason\)') -and (-not [regex]::IsMatch($uplinkFailureHandler, 'UPLINK_STATE_RETRY_WAIT'))
+    'RAK boot and power-off waits are long enough for a real restart' = ((Get-DefineValue -Text $finalMain -Name 'RAK_BOOT_DELAY_MS' -Context 'working main.c') -eq '5000U') -and ((Get-DefineValue -Text $finalMain -Name 'RAK_POWER_OFF_DELAY_MS' -Context 'working main.c') -eq '1000U')
     'battery check remains every ten completed JOIN failures' = ((Get-DefineValue -Text $finalMain -Name 'RAK_JOIN_FAILURES_PER_BATTERY_CHECK' -Context 'working main.c') -eq '10U')
-    'EU868 SF12-safe uplink default is at least 300000 ms' = ([uint32](Normalize-CIntegerToken (Get-DefineValue -Text $finalMain -Name 'UPLINK_PERIOD_MS' -Context 'working main.c')) -ge 300000)
+    'requested uplink period and BUSY retry are five seconds' = ((Get-DefineValue -Text $finalMain -Name 'UPLINK_PERIOD_MS' -Context 'working main.c') -eq '5000U') -and ((Get-DefineValue -Text $finalMain -Name 'UPLINK_BUSY_RETRY_MS' -Context 'working main.c') -eq '5000U')
+    'first uplink is armed immediately after measurements start' = [regex]::IsMatch($finalMain, 'DS18B20_DiscoverCached\(now\).*?next_uplink_tick\s*=\s*now\s*;', 'Singleline')
+    'shutdown requires both low battery and confirmed zero rotation' = [regex]::IsMatch($batteryCompletionHandler, 'BATTERY_REASON_ROTATION_STOP.*?AppLogic_ShouldShutdown\(true,\s*battery_voltage,\s*BAT_LOW_THRESHOLD_V,\s*true,\s*new_pulses\).*?App_EnterEmergency', 'Singleline')
+    'low battery alone has no direct emergency path' = (-not [regex]::IsMatch($finalMain, 'verified battery below 3\.6 V|verified low battery during uplink preparation'))
     'UART ring power-of-two static assertion is present' = [regex]::IsMatch($finalMain, '_Static_assert\s*\(\s*\(RAK_RX_RING_SIZE\s*&\s*\(RAK_RX_RING_SIZE\s*-\s*1U\)\)\s*==\s*0U')
     'PWR_OFF emergency sequence remains high/low one second' = [regex]::IsMatch($finalMain, 'HAL_GPIO_WritePin\(PWR_OFF_GPIO_Port,\s*PWR_OFF_Pin,\s*GPIO_PIN_SET\).*?HAL_Delay\(1000U\).*?HAL_GPIO_WritePin\(PWR_OFF_GPIO_Port,\s*PWR_OFF_Pin,\s*GPIO_PIN_RESET\).*?HAL_Delay\(1000U\)', 'Singleline')
     'project identity is consistently wind' = [regex]::IsMatch($eclipseProject, '<name>wind</name>') -and [regex]::IsMatch($finalIoc, 'ProjectManager\.ProjectName=wind') -and [regex]::IsMatch($debugLaunch, 'Debug/wind\.elf')

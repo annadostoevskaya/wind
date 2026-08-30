@@ -146,9 +146,22 @@ uint32_t AppLogic_RakClassifyLineWithNjsContext(const char *line,
   return event;
 }
 
+bool AppLogic_JoinConfirmed(uint32_t events)
+{
+  return (events & RAK_EVT_JOINED) != 0U;
+}
+
 bool AppLogic_BatteryLow(bool valid, float voltage, float threshold)
 {
   return valid && (voltage < threshold);
+}
+
+bool AppLogic_ShouldShutdown(bool battery_valid, float voltage,
+                             float threshold, bool rotation_window_complete,
+                             uint32_t rotation_pulses)
+{
+  return AppLogic_BatteryLow(battery_valid, voltage, threshold) &&
+         AppLogic_RotationStopped(rotation_window_complete, rotation_pulses);
 }
 
 bool AppLogic_AdcRawAtRail(uint16_t raw, uint16_t maximum)
@@ -218,13 +231,6 @@ float AppLogic_RevolutionsFromPulses(uint32_t pulses,
 bool AppLogic_RotationStopped(bool window_complete, uint32_t pulses)
 {
   return window_complete && (pulses == 0U);
-}
-
-bool AppLogic_ShouldReconnect(bool explicit_network_loss,
-                              uint8_t consecutive_failures,
-                              uint8_t failure_limit)
-{
-  return explicit_network_loss || (consecutive_failures >= failure_limit);
 }
 
 uint16_t AppLogic_RingNext(uint16_t head, uint16_t size_mask)

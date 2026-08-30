@@ -148,25 +148,24 @@ typedef struct
 #define RAK_SEND_CMD_SIZE       (24U + RAK_PAYLOAD_HEX_SIZE)
 #define RAK_MEAS_PAYLOAD_SIZE   33U
 #define RAK_JOIN_ACCEPT_TIMEOUT_MS 5000U
-#define RAK_JOIN_RESULT_TIMEOUT_MS 20000U
+#define RAK_JOIN_RESULT_TIMEOUT_MS 60000U
 #define RAK_JOIN_STATUS_TIMEOUT_MS 5000U
 #define RAK_JOIN_RETRY_DELAY_MS    10000U
 #define RAK_BUSY_BACKOFF_MS        3000U
 #define RAK_JOIN_FAILURES_PER_BATTERY_CHECK 10U
 #define RAK_AT_TIMEOUT_MS       5000U
-#define RAK_BOOT_DELAY_MS       1500U
-#define RAK_POWER_OFF_DELAY_MS  500U
+#define RAK_BOOT_DELAY_MS       5000U
+#define RAK_POWER_OFF_DELAY_MS  1000U
 #define RAK_UART_TX_TIMEOUT_MS  25U
 
-/* Safe default for a 33-byte EU868 uplink when the modem may use SF12.
-   A product build may override this value only when its known data rate and
-   regional duty-cycle policy justify a different interval. */
+/* Product requirement: request a telemetry uplink every five seconds.
+   The RAK modem may still defer/reject a request to enforce regional
+   duty-cycle limits. */
 #ifndef UPLINK_PERIOD_MS
-#define UPLINK_PERIOD_MS        300000U
+#define UPLINK_PERIOD_MS        5000U
 #endif
 #define UPLINK_RESULT_TIMEOUT_MS 30000U
-#define UPLINK_BUSY_RETRY_MS    60000U
-#define UPLINK_MAX_NETWORK_FAILURES 3U
+#define UPLINK_BUSY_RETRY_MS    5000U
 
 #define DEBUG_UART              huart2
 #define DEBUG_LOG_BUFFER_SIZE   192U
@@ -368,10 +367,10 @@ static bool RAK_SendCommand(const char *cmd);
 static bool RAK_SendJoinCommand(void);
 static bool RAK_SendNetworkStatusCommand(void);
 static void RAK_StartJoinAttempt(uint32_t now);
-static void RAK_CompleteJoinFailure(uint32_t now, const char *reason);
+static void RAK_RecordJoinFailure(uint32_t now, const char *reason);
 static void RAK_HandleJoin(uint32_t now, uint32_t events);
 static void RAK_HandleUplink(uint32_t now, uint32_t events);
-static void RAK_CompleteUplinkFailure(uint32_t now, bool network_failure, const char *reason);
+static void RAK_CompleteUplinkFailure(uint32_t now, const char *reason);
 static void RAK_BytesToHex(const uint8_t *bytes, uint16_t length, char *hex, uint16_t hex_size);
 static bool RAK_SendBytesPayload(uint8_t port, const uint8_t *payload, uint16_t payload_size);
 static bool BuildMeasurementPayload(uint8_t *payload, uint16_t payload_size);
@@ -1340,9 +1339,11 @@ static void Battery_HandleCompleted(uint32_t now)
               (int32_t)((battery_voltage - (float)((int32_t)battery_voltage)) * 100.0f),
               adc_bat_raw, (unsigned int)reason);
 
-    if (AppLogic_BatteryLow(result.valid, battery_voltage, BAT_LOW_THRESHOLD_V))
+    if (AppLogic_BatteryLow(result.valid, battery_voltage, BAT_LOW_THRESHOLD_V) &&
+        (reason != BATTERY_REASON_ROTATION_STOP) &&
+        (reason != BATTERY_REASON_WAKE_ROTATION_RESULT))
     {
-      App_EnterEmergency("verified battery below 3.6 V");
+      Debug_Log("[BAT] below 3.6 V; shutdown deferred until zero rotation is confirmed\r\n");
     }
   }
   else
@@ -1368,8 +1369,8 @@ static void Battery_HandleCompleted(uint32_t now)
       }
       else
       {
-        join_state = JOIN_STATE_RETRY_WAIT;
-        join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
+        join_state = JOIN_STATE_WAIT_RESULT;
+        join_deadline = now + RAK_JOIN_RESULT_TIMEOUT_MS;
       }
       break;
 
@@ -1383,8 +1384,8 @@ static void Battery_HandleCompleted(uint32_t now)
       }
       else if (join_state == JOIN_STATE_BATTERY_CHECK)
       {
-        join_state = JOIN_STATE_RETRY_WAIT;
-        join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
+        join_state = JOIN_STATE_WAIT_RESULT;
+        join_deadline = now + RAK_JOIN_RESULT_TIMEOUT_MS;
       }
       break;
 
@@ -1397,13 +1398,16 @@ static void Battery_HandleCompleted(uint32_t now)
       if (result.valid)
       {
         uint32_t new_pulses = Rotation_TakeCheckPulses();
-        if (AppLogic_RotationStopped(true, new_pulses))
+        if (AppLogic_ShouldShutdown(true, battery_voltage, BAT_LOW_THRESHOLD_V,
+                                    true, new_pulses))
         {
-          App_SetState(APP_STATE_STOP, "verified zero rotation and battery OK");
+          App_EnterEmergency("battery below 3.6 V and zero rotation confirmed");
         }
         else
         {
-          Debug_Log("[ROT] %lu new pulses during battery check; cancel STOP\r\n", new_pulses);
+          Debug_Log("[PWR] shutdown cancelled: battery_x100=%ld, new rotation pulses=%lu; "
+                    "both low battery and zero rotation are required\r\n",
+                    (int32_t)(battery_voltage * 100.0f), new_pulses);
           rotation_check_tick = now + ROTATION_CHECK_WINDOW_MS;
         }
       }
@@ -1429,15 +1433,15 @@ static void Battery_HandleCompleted(uint32_t now)
     case BATTERY_REASON_WAKE_ROTATION_RESULT:
       if (result.valid)
       {
-        if (wake_rotation_pulses > 0U)
+        if (AppLogic_ShouldShutdown(true, battery_voltage, BAT_LOW_THRESHOLD_V,
+                                    true, wake_rotation_pulses))
         {
-          next_join_battery_tick = now + BATTERY_ACTIVE_PERIOD_MS;
-          App_StartRakBoot(now);
+          App_EnterEmergency("wake check confirmed low battery and zero rotation");
         }
         else
         {
-          App_SetState(APP_STATE_STOP,
-                       "wake rotation remained zero and final battery check passed");
+          next_join_battery_tick = now + BATTERY_ACTIVE_PERIOD_MS;
+          App_StartRakBoot(now);
         }
       }
       else
@@ -1683,7 +1687,11 @@ static void App_Run(void)
       break;
 
     case APP_STATE_RAK_BOOT:
-      if (TimeReached(now, app_deadline))
+      if (AppLogic_JoinConfirmed(events))
+      {
+        App_StartActiveAfterJoin(now, "+EVT:JOINED during RAK boot");
+      }
+      else if (TimeReached(now, app_deadline))
       {
         RAK_ResetParser();
         join_state = JOIN_STATE_IDLE;
@@ -1711,7 +1719,8 @@ static void App_Run(void)
           DS18B20_DiscoverCached(now);
           ds18b20_next_tick = now;
           next_battery_tick = now;
-          next_uplink_tick = now + UPLINK_PERIOD_MS;
+          next_uplink_tick = now;
+          Debug_Log("[RAK] first uplink armed; waiting for first valid measurement window\r\n");
           pwr_input_low_latched = false;
           App_SetState(APP_STATE_ACTIVE, "measurement power settled");
         }
@@ -1758,12 +1767,6 @@ static void App_Run(void)
           (ds18b20_state == DS18B20_STATE_IDLE))
       {
         (void)ReadAuxAnalogInputs();
-        if (((device_status_flags & STATUS_BATTERY_INVALID) == 0U) &&
-            AppLogic_BatteryLow(true, battery_voltage, BAT_LOW_THRESHOLD_V))
-        {
-          App_EnterEmergency("verified low battery during uplink preparation");
-        }
-
         if (BuildMeasurementPayload(payload, sizeof(payload)) &&
             RAK_SendBytesPayload(2U, payload, sizeof(payload)))
         {
@@ -1773,7 +1776,7 @@ static void App_Run(void)
         }
         else
         {
-          RAK_CompleteUplinkFailure(now, false, "AT+SEND UART transmit failed");
+          RAK_CompleteUplinkFailure(now, "AT+SEND UART transmit failed");
         }
       }
       break;
@@ -2070,7 +2073,10 @@ static bool RAK_SendCommand(const char *cmd)
 
 static bool RAK_SendJoinCommand(void)
 {
-  return RAK_SendCommand("AT+JOIN=1:0:10:1\r\n");
+  /* RUI3 limits one command to 255 automatic attempts.  Auto-join remains
+     enabled across power cycles, and the STM32 resubmits this command forever
+     until the exact asynchronous +EVT:JOINED line is received. */
+  return RAK_SendCommand("AT+JOIN=1:1:10:255\r\n");
 }
 
 static bool RAK_SendNetworkStatusCommand(void)
@@ -2091,17 +2097,17 @@ static void RAK_StartJoinAttempt(uint32_t now)
   }
   else
   {
-    join_state = JOIN_STATE_RETRY_WAIT;
-    join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
-    Debug_Log("[RAK] JOIN command not transmitted; radio attempt not counted\r\n");
+    Debug_Log("[RAK] JOIN command TX failed; power-cycle RAK\r\n");
+    App_RequestReconnect(now, "JOIN command UART transmit failed");
   }
 }
 
-static void RAK_CompleteJoinFailure(uint32_t now, const char *reason)
+static void RAK_RecordJoinFailure(uint32_t now, const char *reason)
 {
   join_failed_attempts++;
   join_failures_since_battery++;
-  Debug_Log("[RAK] JOIN failed #%lu (%u/%u before battery check): %s\r\n",
+  Debug_Log("[RAK] JOIN failure event #%lu (%u/%u before battery check): %s; "
+            "RAK automatic retries remain active\r\n",
             join_failed_attempts, (unsigned int)join_failures_since_battery,
             (unsigned int)RAK_JOIN_FAILURES_PER_BATTERY_CHECK, reason);
   LED_Indicate(false, now);
@@ -2123,17 +2129,16 @@ static void RAK_CompleteJoinFailure(uint32_t now, const char *reason)
   }
   else
   {
-    join_state = JOIN_STATE_RETRY_WAIT;
-    join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
+    join_state = JOIN_STATE_WAIT_RESULT;
+    join_deadline = now + RAK_JOIN_RESULT_TIMEOUT_MS;
   }
 }
 
 static void RAK_HandleJoin(uint32_t now, uint32_t events)
 {
-  if ((events & (RAK_EVT_JOINED | RAK_EVT_NJS_1)) != 0U)
+  if (AppLogic_JoinConfirmed(events))
   {
-    App_StartActiveAfterJoin(now,
-      ((events & RAK_EVT_JOINED) != 0U) ? "+EVT:JOINED" : "AT+NJS:1");
+    App_StartActiveAfterJoin(now, "+EVT:JOINED");
     return;
   }
 
@@ -2142,7 +2147,7 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
        (join_state == JOIN_STATE_WAIT_RESULT) ||
        (join_state == JOIN_STATE_WAIT_STATUS)))
   {
-    RAK_CompleteJoinFailure(now, "JOIN_FAILED event");
+    RAK_RecordJoinFailure(now, "JOIN_FAILED event");
     return;
   }
 
@@ -2178,7 +2183,7 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
     }
     else
     {
-      RAK_CompleteJoinFailure(now, "AT/status error after a real JOIN attempt");
+      RAK_RecordJoinFailure(now, "AT/status error after a real JOIN attempt");
     }
     return;
   }
@@ -2198,17 +2203,7 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
       }
       else if (TimeReached(now, join_deadline))
       {
-        if (RAK_SendNetworkStatusCommand())
-        {
-          join_status_after_busy = false;
-          join_state = JOIN_STATE_WAIT_STATUS;
-          join_deadline = now + RAK_JOIN_STATUS_TIMEOUT_MS;
-          Debug_Log("[RAK] JOIN acceptance timeout; checking AT+NJS\r\n");
-        }
-        else
-        {
-          RAK_CompleteJoinFailure(now, "no response and NJS query TX failed");
-        }
+        App_RequestReconnect(now, "RAK silent after JOIN command");
       }
       break;
 
@@ -2224,37 +2219,28 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
         }
         else
         {
-          RAK_CompleteJoinFailure(now, "final event lost and NJS query TX failed");
+          App_RequestReconnect(now, "NJS query UART transmit failed");
         }
       }
       break;
 
     case JOIN_STATE_WAIT_STATUS:
-      if ((events & RAK_EVT_NJS_0) != 0U)
+      if ((events & RAK_EVT_NJS_1) != 0U)
       {
-        if (join_status_after_busy)
-        {
-          join_state = JOIN_STATE_RETRY_WAIT;
-          join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
-          Debug_Log("[RAK] NJS=0 after BUSY; retry JOIN without counting a radio failure\r\n");
-        }
-        else
-        {
-          RAK_CompleteJoinFailure(now, "AT+NJS:0");
-        }
+        /* NJS=1 proves that the modem is joined, but product startup is gated
+           by the requested exact JOINED event.  Restart to obtain a fresh,
+           observable JOIN sequence instead of silently entering ACTIVE. */
+        App_RequestReconnect(now, "NJS=1 received without +EVT:JOINED");
+      }
+      else if ((events & RAK_EVT_NJS_0) != 0U)
+      {
+        join_state = JOIN_STATE_RETRY_WAIT;
+        join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
+        Debug_Log("[RAK] NJS=0; retry JOIN command without a total-attempt limit\r\n");
       }
       else if (TimeReached(now, join_deadline))
       {
-        if (join_status_after_busy)
-        {
-          join_state = JOIN_STATE_RETRY_WAIT;
-          join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
-          Debug_Log("[RAK] status timeout after BUSY; no radio failure counted\r\n");
-        }
-        else
-        {
-          RAK_CompleteJoinFailure(now, "AT+NJS status timeout");
-        }
+        App_RequestReconnect(now, "RAK silent after AT+NJS query");
       }
       break;
 
@@ -2268,7 +2254,7 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
         }
         else
         {
-          join_deadline = now + RAK_BUSY_BACKOFF_MS;
+          App_RequestReconnect(now, "NJS query UART transmit failed after BUSY");
         }
       }
       break;
@@ -2286,8 +2272,7 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
   }
 }
 
-static void RAK_CompleteUplinkFailure(uint32_t now, bool network_failure,
-                                      const char *reason)
+static void RAK_CompleteUplinkFailure(uint32_t now, const char *reason)
 {
   device_status_flags |= STATUS_SEND_ERROR;
   consecutive_send_failures++;
@@ -2295,17 +2280,7 @@ static void RAK_CompleteUplinkFailure(uint32_t now, bool network_failure,
   Debug_Log("[RAK] uplink failed (%u consecutive): %s\r\n",
             (unsigned int)consecutive_send_failures, reason);
 
-  if (AppLogic_ShouldReconnect(network_failure, consecutive_send_failures,
-                               UPLINK_MAX_NETWORK_FAILURES))
-  {
-    App_RequestReconnect(now, network_failure ? "RAK reports no network" :
-                         "repeated uplink failures");
-  }
-  else
-  {
-    uplink_state = UPLINK_STATE_RETRY_WAIT;
-    uplink_deadline = now + UPLINK_BUSY_RETRY_MS;
-  }
+  App_RequestReconnect(now, reason);
 }
 
 static void RAK_HandleUplink(uint32_t now, uint32_t events)
@@ -2316,7 +2291,7 @@ static void RAK_HandleUplink(uint32_t now, uint32_t events)
   if ((events & (RAK_EVT_NO_NETWORK | RAK_EVT_NJS_0)) != 0U)
   {
     device_status_flags |= STATUS_JOIN_LOST;
-    RAK_CompleteUplinkFailure(now, true, "network membership lost");
+    RAK_CompleteUplinkFailure(now, "network membership lost");
     return;
   }
 
@@ -2356,7 +2331,7 @@ static void RAK_HandleUplink(uint32_t now, uint32_t events)
   {
     if (AppLogic_UplinkFailureIsCurrent(transaction_pending))
     {
-      RAK_CompleteUplinkFailure(now, false, "SEND failure/AT error event");
+      RAK_CompleteUplinkFailure(now, "SEND failure/AT error event");
     }
     else
     {
@@ -2376,14 +2351,14 @@ static void RAK_HandleUplink(uint32_t now, uint32_t events)
       }
       else if (TimeReached(now, uplink_deadline))
       {
-        RAK_CompleteUplinkFailure(now, false, "AT+SEND acceptance timeout");
+        RAK_CompleteUplinkFailure(now, "AT+SEND acceptance timeout");
       }
       break;
 
     case UPLINK_STATE_WAIT_RESULT:
       if (TimeReached(now, uplink_deadline))
       {
-        RAK_CompleteUplinkFailure(now, false, "final SEND event timeout");
+        RAK_CompleteUplinkFailure(now, "final SEND event timeout");
       }
       break;
 

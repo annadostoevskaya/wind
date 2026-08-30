@@ -98,7 +98,7 @@ static BatteryModelResult model_battery_retries(const bool attempt_ok[3],
 static void model_join_event(JoinModel *model, uint32_t event,
                              bool battery_valid, float battery_voltage)
 {
-  if ((event & (RAK_EVT_JOINED | RAK_EVT_NJS_1)) != 0U)
+  if (AppLogic_JoinConfirmed(event))
   {
     model->joined = true;
     return;
@@ -110,8 +110,8 @@ static void model_join_event(JoinModel *model, uint32_t event,
     {
       model->battery_checks++;
       model->emergency =
-        AppLogic_BatteryLow(battery_valid, battery_voltage,
-                            TEST_BAT_THRESHOLD);
+        AppLogic_ShouldShutdown(battery_valid, battery_voltage,
+                                TEST_BAT_THRESHOLD, false, 0U);
     }
   }
 }
@@ -161,8 +161,8 @@ int main(void)
 
   model_join_event(&model, AppLogic_RakClassifyLine("AT+NJS:1"),
                    true, 4.0f);
-  require_true(model.joined,
-               "lost asynchronous JOIN event is recovered by AT+NJS:1");
+  require_true(!model.joined,
+               "AT+NJS:1 never substitutes for the exact +EVT:JOINED event");
 
   model = (JoinModel){0U, 0U, false, false};
   model_join_event(&model, AppLogic_RakClassifyLine("AT_BUSY_ERROR"),
@@ -186,7 +186,8 @@ int main(void)
   {
     model_join_event(&model, RAK_EVT_JOIN_FAILED, true, 3.59f);
   }
-  require_true(model.emergency, "low battery after tenth failed JOIN");
+  require_true(!model.emergency,
+               "low battery alone during JOIN never causes shutdown");
 
   require_true((AppLogic_RakClassifyLine("OK") == RAK_EVT_OK) &&
                (AppLogic_RakClassifyLine("OKAY") == 0U) &&
@@ -202,7 +203,7 @@ int main(void)
                (AppLogic_RakClassifyLine("AT+NJS:0") == RAK_EVT_NJS_0) &&
                (AppLogic_RakClassifyLine("AT+NJS=1") == RAK_EVT_NJS_1) &&
                (AppLogic_RakClassifyLine("AT+NJS=0") == RAK_EVT_NJS_0),
-               "lost JOIN event is resolved by exact NJS status");
+               "exact NJS status remains available for liveness checks");
   require_true((AppLogic_RakClassifyLine("1") == 0U) &&
                (AppLogic_RakClassifyLineWithNjsContext("1", true) ==
                 RAK_EVT_NJS_1) &&
@@ -307,7 +308,7 @@ int main(void)
   require_true(battery.valid && battery.at_rail &&
                AppLogic_BatteryLow(true, battery.voltage,
                                    TEST_BAT_THRESHOLD),
-               "HAL_OK battery raw 0 is valid zero volts and emergency-low");
+               "HAL_OK battery raw 0 is valid and classified as low");
 
   battery = model_battery_read(true, true, 1U);
   require_true(battery.valid && !battery.at_rail &&
@@ -421,16 +422,24 @@ int main(void)
   require_true(AppLogic_RotationStopped(true, 0U) &&
                !AppLogic_RotationStopped(false, 0U),
                "zero rotation requires a completed independent window");
+  require_true(AppLogic_ShouldShutdown(true, 3.59f, TEST_BAT_THRESHOLD,
+                                      true, 0U),
+               "shutdown requires low battery and confirmed zero rotation");
+  require_true(!AppLogic_ShouldShutdown(true, 3.59f, TEST_BAT_THRESHOLD,
+                                       true, 1U) &&
+               !AppLogic_ShouldShutdown(true, 4.0f, TEST_BAT_THRESHOLD,
+                                        true, 0U) &&
+               !AppLogic_ShouldShutdown(true, 3.59f, TEST_BAT_THRESHOLD,
+                                        false, 0U) &&
+               !AppLogic_ShouldShutdown(false, 0.0f, TEST_BAT_THRESHOLD,
+                                        true, 0U),
+               "either condition missing always cancels shutdown");
   require_true(AppLogic_RevolutionsFromPulses(6U, 6U) == 1.0f,
                "six pulses remain one revolution, never RPM");
 
-  require_true((AppLogic_RakClassifyLine("AT_NO_NETWORK_JOINED") ==
-                RAK_EVT_NO_NETWORK) &&
-               AppLogic_ShouldReconnect(true, 1U, 3U),
-               "LoRaWAN membership loss triggers reconnect");
-  require_true(!AppLogic_ShouldReconnect(false, 2U, 3U) &&
-               AppLogic_ShouldReconnect(false, 3U, 3U),
-               "uplink reconnect threshold changes only on counted failures");
+  require_true(AppLogic_RakClassifyLine("AT_NO_NETWORK_JOINED") ==
+               RAK_EVT_NO_NETWORK,
+               "LoRaWAN membership loss is classified for immediate reconnect");
   require_true(AppLogic_DeadlineReached(30000U, 30000U) &&
                !AppLogic_UplinkFailureIsCurrent(false),
                "deadlines and late SEND failure accounting remain stable");

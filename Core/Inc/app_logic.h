@@ -39,8 +39,12 @@ bool AppLogic_LineStartsWith(const char *line, const char *prefix);
 uint32_t AppLogic_RakClassifyLine(const char *line);
 uint32_t AppLogic_RakClassifyLineWithNjsContext(const char *line,
                                                 bool njs_reply_expected);
+bool AppLogic_JoinConfirmed(uint32_t events);
 
 bool AppLogic_BatteryLow(bool valid, float voltage, float threshold);
+bool AppLogic_ShouldShutdown(bool battery_valid, float voltage,
+                             float threshold, bool rotation_window_complete,
+                             uint32_t rotation_pulses);
 bool AppLogic_AdcRawAtRail(uint16_t raw, uint16_t maximum);
 void AppLogic_BatteryAccumulatorInit(AppLogicBatteryAccumulator *accumulator);
 bool AppLogic_BatteryAccumulatorAdd(AppLogicBatteryAccumulator *accumulator,
@@ -54,9 +58,6 @@ bool AppLogic_UplinkFailureIsCurrent(bool transaction_pending);
 float AppLogic_RevolutionsFromPulses(uint32_t pulses,
                                     uint32_t pulses_per_revolution);
 bool AppLogic_RotationStopped(bool window_complete, uint32_t pulses);
-bool AppLogic_ShouldReconnect(bool explicit_network_loss,
-                              uint8_t consecutive_failures,
-                              uint8_t failure_limit);
 uint16_t AppLogic_RingNext(uint16_t head, uint16_t size_mask);
 
 AppLogicAdcBlockAction AppLogic_AdcSelectBlock(uint8_t dma_error,
