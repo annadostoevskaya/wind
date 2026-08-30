@@ -96,7 +96,9 @@ static BatteryModelResult model_battery_retries(const bool attempt_ok[3],
 }
 
 static void model_join_event(JoinModel *model, uint32_t event,
-                             bool battery_valid, float battery_voltage)
+                             bool battery_valid, float battery_voltage,
+                             bool rotation_window_complete,
+                             uint32_t rotation_pulses)
 {
   if (AppLogic_JoinConfirmed(event))
   {
@@ -106,12 +108,13 @@ static void model_join_event(JoinModel *model, uint32_t event,
   if ((event & RAK_EVT_JOIN_FAILED) != 0U)
   {
     model->failed_joins++;
-    if ((model->failed_joins % 10U) == 0U)
+    if ((model->failed_joins % 3U) == 0U)
     {
       model->battery_checks++;
       model->emergency =
         AppLogic_ShouldShutdown(battery_valid, battery_voltage,
-                                TEST_BAT_THRESHOLD, false, 0U);
+                                TEST_BAT_THRESHOLD,
+                                rotation_window_complete, rotation_pulses);
     }
   }
 }
@@ -151,43 +154,53 @@ int main(void)
   uint8_t bad_scratchpad[9];
 
   model_join_event(&model, AppLogic_RakClassifyLine("+EVT:JOINED"),
-                   true, 4.0f);
+                   true, 4.0f, false, 0U);
   require_true(model.joined, "successful JOIN on first attempt");
 
   model = (JoinModel){0U, 0U, false, false};
-  model_join_event(&model, AppLogic_RakClassifyLine("OK"), true, 4.0f);
+  model_join_event(&model, AppLogic_RakClassifyLine("OK"), true, 4.0f,
+                   false, 0U);
   require_true(!model.joined && (model.failed_joins == 0U),
                "bare OK accepts the command but never completes JOIN");
 
   model_join_event(&model, AppLogic_RakClassifyLine("AT+NJS:1"),
-                   true, 4.0f);
+                   true, 4.0f, false, 0U);
   require_true(!model.joined,
                "AT+NJS:1 never substitutes for the exact +EVT:JOINED event");
 
   model = (JoinModel){0U, 0U, false, false};
   model_join_event(&model, AppLogic_RakClassifyLine("AT_BUSY_ERROR"),
-                   true, 4.0f);
+                   true, 4.0f, false, 0U);
   require_true((model.failed_joins == 0U) &&
                (model.battery_checks == 0U) && !model.joined,
                "AT_BUSY_ERROR is not a completed radio JOIN failure");
 
   model = (JoinModel){0U, 0U, false, false};
-  for (unsigned int i = 0U; i < 10U; i++)
+  for (unsigned int i = 0U; i < 3U; i++)
   {
     model_join_event(&model,
-      AppLogic_RakClassifyLine("+EVT:JOIN_FAILED_RX_TIMEOUT"), true, 4.0f);
+      AppLogic_RakClassifyLine("+EVT:JOIN_FAILED_RX_TIMEOUT"), true, 4.0f,
+      true, 0U);
   }
-  require_true((model.failed_joins == 10U) &&
+  require_true((model.failed_joins == 3U) &&
                (model.battery_checks == 1U) && !model.emergency,
-               "ten failed JOINs with healthy battery");
+               "three failed JOINs check health and restart when battery is healthy");
 
   model = (JoinModel){0U, 0U, false, false};
-  for (unsigned int i = 0U; i < 10U; i++)
+  for (unsigned int i = 0U; i < 3U; i++)
   {
-    model_join_event(&model, RAK_EVT_JOIN_FAILED, true, 3.59f);
+    model_join_event(&model, RAK_EVT_JOIN_FAILED, true, 3.59f, true, 1U);
   }
   require_true(!model.emergency,
-               "low battery alone during JOIN never causes shutdown");
+               "three failed JOINs restart when rotation is present despite low battery");
+
+  model = (JoinModel){0U, 0U, false, false};
+  for (unsigned int i = 0U; i < 3U; i++)
+  {
+    model_join_event(&model, RAK_EVT_JOIN_FAILED, true, 3.59f, true, 0U);
+  }
+  require_true(model.emergency,
+               "three failed JOINs shut down only with low battery and zero rotation");
 
   require_true((AppLogic_RakClassifyLine("OK") == RAK_EVT_OK) &&
                (AppLogic_RakClassifyLine("OKAY") == 0U) &&

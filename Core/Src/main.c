@@ -39,6 +39,9 @@ typedef enum
   APP_STATE_RAK_OFF_WAIT,
   APP_STATE_RAK_BOOT,
   APP_STATE_JOINING,
+  APP_STATE_JOIN_HEALTH_ROTATION_SETTLE,
+  APP_STATE_JOIN_HEALTH_ROTATION_CHECK,
+  APP_STATE_JOIN_HEALTH_BATTERY,
   APP_STATE_ACTIVE_POWER_SETTLE,
   APP_STATE_ACTIVE,
   APP_STATE_STOP,
@@ -51,12 +54,14 @@ typedef enum
 typedef enum
 {
   JOIN_STATE_IDLE = 0,
+  JOIN_STATE_WAIT_STOP_ACCEPT,
+  JOIN_STATE_STOP_RETRY_WAIT,
+  JOIN_STATE_START_WAIT,
   JOIN_STATE_WAIT_ACCEPT,
   JOIN_STATE_WAIT_RESULT,
   JOIN_STATE_WAIT_STATUS,
   JOIN_STATE_BUSY_BACKOFF,
-  JOIN_STATE_RETRY_WAIT,
-  JOIN_STATE_BATTERY_CHECK
+  JOIN_STATE_RETRY_WAIT
 } JoinState;
 
 typedef enum
@@ -70,7 +75,7 @@ typedef enum
 typedef enum
 {
   BATTERY_REASON_NONE = 0,
-  BATTERY_REASON_JOIN_FAILURES,
+  BATTERY_REASON_JOIN_HEALTH,
   BATTERY_REASON_JOIN_PERIODIC,
   BATTERY_REASON_ACTIVE_PERIODIC,
   BATTERY_REASON_ROTATION_STOP,
@@ -151,8 +156,10 @@ typedef struct
 #define RAK_JOIN_RESULT_TIMEOUT_MS 60000U
 #define RAK_JOIN_STATUS_TIMEOUT_MS 5000U
 #define RAK_JOIN_RETRY_DELAY_MS    10000U
+#define RAK_JOIN_STOP_SETTLE_MS    500U
 #define RAK_BUSY_BACKOFF_MS        3000U
-#define RAK_JOIN_FAILURES_PER_BATTERY_CHECK 10U
+#define RAK_JOIN_ATTEMPTS_PER_BATCH 3U
+#define JOIN_HEALTH_ROTATION_WINDOW_MS 5000U
 #define RAK_AT_TIMEOUT_MS       5000U
 #define RAK_BOOT_DELAY_MS       5000U
 #define RAK_POWER_OFF_DELAY_MS  1000U
@@ -273,7 +280,7 @@ static uint32_t app_deadline = 0;
 static uint32_t join_deadline = 0;
 static uint32_t join_attempt_number = 0;
 static uint32_t join_failed_attempts = 0;
-static uint8_t join_failures_since_battery = 0;
+static uint8_t join_failures_in_batch = 0;
 static bool join_confirmed_pending = false;
 static bool join_status_after_busy = false;
 static uint32_t uplink_deadline = 0;
@@ -290,6 +297,7 @@ static uint32_t next_join_battery_tick = 0;
 static bool pwr_input_low_latched = false;
 static BatteryReason wake_battery_reason = BATTERY_REASON_WAKEUP;
 static uint32_t wake_rotation_pulses = 0;
+static uint32_t join_health_rotation_pulses = 0;
 
 static uint8_t device_status_flags = 0;
 static bool rtc_wakeup_ready = false;
@@ -320,6 +328,8 @@ static void App_SetExternalPower(bool rak, bool analog, bool frequency, bool aux
 static void App_StartRakBoot(uint32_t now);
 static void App_StartActiveAfterJoin(uint32_t now, const char *confirmation);
 static void App_RequestReconnect(uint32_t now, const char *reason);
+static void App_StartJoinHealthCheck(uint32_t now, const char *reason);
+static void App_ResumeJoinAfterHealthCheck(uint32_t now);
 static void App_EnterEmergency(const char *reason);
 static void App_EnterStopCycle(void);
 
@@ -364,8 +374,10 @@ static void RAK_ResetParser(void);
 static void RAK_ProcessRx(void);
 static uint32_t RAK_ClassifyLine(const char *line);
 static bool RAK_SendCommand(const char *cmd);
+static bool RAK_SendStopJoinCommand(void);
 static bool RAK_SendJoinCommand(void);
 static bool RAK_SendNetworkStatusCommand(void);
+static void RAK_StartJoinPreparation(uint32_t now);
 static void RAK_StartJoinAttempt(uint32_t now);
 static void RAK_RecordJoinFailure(uint32_t now, const char *reason);
 static void RAK_HandleJoin(uint32_t now, uint32_t events);
@@ -472,6 +484,9 @@ static const char *App_StateName(AppState state)
     case APP_STATE_RAK_OFF_WAIT: return "RAK_OFF_WAIT";
     case APP_STATE_RAK_BOOT: return "RAK_BOOT";
     case APP_STATE_JOINING: return "JOINING";
+    case APP_STATE_JOIN_HEALTH_ROTATION_SETTLE: return "JOIN_HEALTH_ROTATION_SETTLE";
+    case APP_STATE_JOIN_HEALTH_ROTATION_CHECK: return "JOIN_HEALTH_ROTATION_CHECK";
+    case APP_STATE_JOIN_HEALTH_BATTERY: return "JOIN_HEALTH_BATTERY";
     case APP_STATE_ACTIVE_POWER_SETTLE: return "ACTIVE_POWER_SETTLE";
     case APP_STATE_ACTIVE: return "ACTIVE";
     case APP_STATE_STOP: return "STOP";
@@ -1340,6 +1355,7 @@ static void Battery_HandleCompleted(uint32_t now)
               adc_bat_raw, (unsigned int)reason);
 
     if (AppLogic_BatteryLow(result.valid, battery_voltage, BAT_LOW_THRESHOLD_V) &&
+        (reason != BATTERY_REASON_JOIN_HEALTH) &&
         (reason != BATTERY_REASON_ROTATION_STOP) &&
         (reason != BATTERY_REASON_WAKE_ROTATION_RESULT))
     {
@@ -1360,17 +1376,20 @@ static void Battery_HandleCompleted(uint32_t now)
 
   switch (reason)
   {
-    case BATTERY_REASON_JOIN_FAILURES:
-      next_join_battery_tick = now + BATTERY_ACTIVE_PERIOD_MS;
-      if (join_confirmed_pending)
+    case BATTERY_REASON_JOIN_HEALTH:
+      if (result.valid &&
+          AppLogic_ShouldShutdown(true, battery_voltage, BAT_LOW_THRESHOLD_V,
+                                  true, join_health_rotation_pulses))
       {
-        join_confirmed_pending = false;
-        App_StartActiveAfterJoin(now, "late JOINED while checking battery");
+        App_EnterEmergency("JOIN unavailable: battery below 3.6 V and zero rotation confirmed");
       }
       else
       {
-        join_state = JOIN_STATE_WAIT_RESULT;
-        join_deadline = now + RAK_JOIN_RESULT_TIMEOUT_MS;
+        Debug_Log("[JOIN-CHECK] battery_valid=%u battery_x100=%ld pulses=%lu\r\n",
+                  result.valid ? 1U : 0U,
+                  result.valid ? (int32_t)(battery_voltage * 100.0f) : -1L,
+                  join_health_rotation_pulses);
+        App_ResumeJoinAfterHealthCheck(now);
       }
       break;
 
@@ -1381,11 +1400,6 @@ static void Battery_HandleCompleted(uint32_t now)
       {
         join_confirmed_pending = false;
         App_StartActiveAfterJoin(now, "late JOINED while checking battery");
-      }
-      else if (join_state == JOIN_STATE_BATTERY_CHECK)
-      {
-        join_state = JOIN_STATE_WAIT_RESULT;
-        join_deadline = now + RAK_JOIN_RESULT_TIMEOUT_MS;
       }
       break;
 
@@ -1479,8 +1493,7 @@ static void App_StartRakBoot(uint32_t now)
 
 static void App_StartActiveAfterJoin(uint32_t now, const char *confirmation)
 {
-  if ((battery_request == BATTERY_REASON_JOIN_FAILURES) ||
-      (battery_request == BATTERY_REASON_JOIN_PERIODIC))
+  if (battery_request == BATTERY_REASON_JOIN_PERIODIC)
   {
     join_confirmed_pending = true;
     Debug_Log("[RAK] JOIN confirmed by %s; finish pending battery check first\r\n", confirmation);
@@ -1488,7 +1501,7 @@ static void App_StartActiveAfterJoin(uint32_t now, const char *confirmation)
   }
 
   join_confirmed_pending = false;
-  join_failures_since_battery = 0U;
+  join_failures_in_batch = 0U;
   next_join_battery_tick = 0U;
   consecutive_send_failures = 0U;
   uplink_state = UPLINK_STATE_IDLE;
@@ -1511,6 +1524,30 @@ static void App_RequestReconnect(uint32_t now, const char *reason)
   uplink_state = UPLINK_STATE_IDLE;
   next_join_battery_tick = now + BATTERY_ACTIVE_PERIOD_MS;
   App_SetState(APP_STATE_RAK_OFF_WAIT, reason);
+}
+
+static void App_StartJoinHealthCheck(uint32_t now, const char *reason)
+{
+  Debug_Log("[JOIN-CHECK] three JOIN attempts exhausted: %s\r\n", reason);
+  App_StopMeasurements();
+  RAK_UartStop();
+  DS18B20_LineSafeOff();
+  Rotation_SetExtiEnabled(false);
+  Rotation_ResetCounters();
+  App_SetExternalPower(false, false, true, false, false);
+  join_state = JOIN_STATE_IDLE;
+  uplink_state = UPLINK_STATE_IDLE;
+  app_deadline = now + MEASUREMENT_POWER_SETTLE_MS;
+  App_SetState(APP_STATE_JOIN_HEALTH_ROTATION_SETTLE,
+               "RAK off; settle ON_FR before five-second rotation check");
+}
+
+static void App_ResumeJoinAfterHealthCheck(uint32_t now)
+{
+  join_failures_in_batch = 0U;
+  next_join_battery_tick = now + BATTERY_ACTIVE_PERIOD_MS;
+  Debug_Log("[JOIN-CHECK] shutdown conditions not both true; start a new three-attempt JOIN batch\r\n");
+  App_StartRakBoot(now);
 }
 
 static void App_EnterStopCycle(void)
@@ -1696,12 +1733,44 @@ static void App_Run(void)
         RAK_ResetParser();
         join_state = JOIN_STATE_IDLE;
         App_SetState(APP_STATE_JOINING, "RAK boot complete; stale partial UART line cleared");
-        RAK_StartJoinAttempt(now);
+        RAK_StartJoinPreparation(now);
       }
       break;
 
     case APP_STATE_JOINING:
       RAK_HandleJoin(now, events);
+      break;
+
+    case APP_STATE_JOIN_HEALTH_ROTATION_SETTLE:
+      if (TimeReached(now, app_deadline))
+      {
+        Rotation_ResetCounters();
+        Rotation_SetExtiEnabled(true);
+        app_deadline = now + JOIN_HEALTH_ROTATION_WINDOW_MS;
+        App_SetState(APP_STATE_JOIN_HEALTH_ROTATION_CHECK,
+                     "five-second pre-JOIN rotation window started");
+      }
+      break;
+
+    case APP_STATE_JOIN_HEALTH_ROTATION_CHECK:
+      if (TimeReached(now, app_deadline))
+      {
+        join_health_rotation_pulses = Rotation_TakeCheckPulses();
+        Rotation_SetExtiEnabled(false);
+        HAL_GPIO_WritePin(ON_FR_GPIO_Port, ON_FR_Pin, GPIO_PIN_RESET);
+        Debug_Log("[JOIN-CHECK] rotation complete: pulses=%lu window=%lu ms; RAK remains off\r\n",
+                  join_health_rotation_pulses,
+                  (uint32_t)JOIN_HEALTH_ROTATION_WINDOW_MS);
+        App_SetState(APP_STATE_JOIN_HEALTH_BATTERY,
+                     "rotation captured; verify battery before shutdown or next JOIN batch");
+      }
+      break;
+
+    case APP_STATE_JOIN_HEALTH_BATTERY:
+      if (battery_request == BATTERY_REASON_NONE)
+      {
+        Battery_Start(BATTERY_REASON_JOIN_HEALTH, now);
+      }
       break;
 
     case APP_STATE_ACTIVE_POWER_SETTLE:
@@ -2071,12 +2140,17 @@ static bool RAK_SendCommand(const char *cmd)
   return true;
 }
 
+static bool RAK_SendStopJoinCommand(void)
+{
+  /* Cancel a persisted auto-join before starting the controlled batch. */
+  return RAK_SendCommand("AT+JOIN=0\r\n");
+}
+
 static bool RAK_SendJoinCommand(void)
 {
-  /* RUI3 limits one command to 255 automatic attempts.  Auto-join remains
-     enabled across power cycles, and the STM32 resubmits this command forever
-     until the exact asynchronous +EVT:JOINED line is received. */
-  return RAK_SendCommand("AT+JOIN=1:1:10:255\r\n");
+  /* One modem attempt per command lets the STM32 count exactly three completed
+     failures before the battery/rotation gate. */
+  return RAK_SendCommand("AT+JOIN=1:0:10:1\r\n");
 }
 
 static bool RAK_SendNetworkStatusCommand(void)
@@ -2084,16 +2158,33 @@ static bool RAK_SendNetworkStatusCommand(void)
   return RAK_SendCommand("AT+NJS=?\r\n");
 }
 
+static void RAK_StartJoinPreparation(uint32_t now)
+{
+  join_status_after_busy = false;
+  if (RAK_SendStopJoinCommand())
+  {
+    join_state = JOIN_STATE_WAIT_STOP_ACCEPT;
+    join_deadline = now + RAK_JOIN_ACCEPT_TIMEOUT_MS;
+    Debug_Log("[RAK] disabling persisted auto-join before controlled three-attempt batch\r\n");
+  }
+  else
+  {
+    App_RequestReconnect(now, "stop-auto-join command UART transmit failed");
+  }
+}
+
 static void RAK_StartJoinAttempt(uint32_t now)
 {
   join_status_after_busy = false;
+  RAK_ResetParser();
   if (RAK_SendJoinCommand())
   {
     join_attempt_number++;
     join_state = JOIN_STATE_WAIT_ACCEPT;
     join_deadline = now + RAK_JOIN_ACCEPT_TIMEOUT_MS;
-    Debug_Log("[RAK] JOIN attempt #%lu started; failures=%lu\r\n",
-              join_attempt_number, join_failed_attempts);
+    Debug_Log("[RAK] JOIN attempt #%lu started; batch_progress=%u/%u total_failures=%lu\r\n",
+              join_attempt_number, (unsigned int)(join_failures_in_batch + 1U),
+              (unsigned int)RAK_JOIN_ATTEMPTS_PER_BATCH, join_failed_attempts);
   }
   else
   {
@@ -2105,32 +2196,21 @@ static void RAK_StartJoinAttempt(uint32_t now)
 static void RAK_RecordJoinFailure(uint32_t now, const char *reason)
 {
   join_failed_attempts++;
-  join_failures_since_battery++;
-  Debug_Log("[RAK] JOIN failure event #%lu (%u/%u before battery check): %s; "
-            "RAK automatic retries remain active\r\n",
-            join_failed_attempts, (unsigned int)join_failures_since_battery,
-            (unsigned int)RAK_JOIN_FAILURES_PER_BATTERY_CHECK, reason);
+  join_failures_in_batch++;
+  Debug_Log("[RAK] JOIN attempt failed; batch_progress=%u/%u total_failures=%lu: %s\r\n",
+            (unsigned int)join_failures_in_batch,
+            (unsigned int)RAK_JOIN_ATTEMPTS_PER_BATCH,
+            join_failed_attempts, reason);
   LED_Indicate(false, now);
 
-  if (join_failures_since_battery >= RAK_JOIN_FAILURES_PER_BATTERY_CHECK)
+  if (join_failures_in_batch >= RAK_JOIN_ATTEMPTS_PER_BATCH)
   {
-    join_failures_since_battery = 0U;
-    join_state = JOIN_STATE_BATTERY_CHECK;
-    if (battery_request == BATTERY_REASON_JOIN_PERIODIC)
-    {
-      /* Reuse the already-settling conversion, but preserve the mandatory
-         ten-real-failures checkpoint semantics. */
-      battery_request = BATTERY_REASON_JOIN_FAILURES;
-    }
-    else
-    {
-      Battery_Start(BATTERY_REASON_JOIN_FAILURES, now);
-    }
+    App_StartJoinHealthCheck(now, reason);
   }
   else
   {
-    join_state = JOIN_STATE_WAIT_RESULT;
-    join_deadline = now + RAK_JOIN_RESULT_TIMEOUT_MS;
+    join_state = JOIN_STATE_RETRY_WAIT;
+    join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
   }
 }
 
@@ -2139,6 +2219,28 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
   if (AppLogic_JoinConfirmed(events))
   {
     App_StartActiveAfterJoin(now, "+EVT:JOINED");
+    return;
+  }
+
+  if (join_state == JOIN_STATE_WAIT_STOP_ACCEPT)
+  {
+    if ((events & (RAK_EVT_OK | RAK_EVT_ERROR)) != 0U)
+    {
+      join_state = JOIN_STATE_START_WAIT;
+      join_deadline = now + RAK_JOIN_STOP_SETTLE_MS;
+      Debug_Log("[RAK] stop-auto-join phase complete; controlled JOIN starts in %lu ms\r\n",
+                (uint32_t)RAK_JOIN_STOP_SETTLE_MS);
+    }
+    else if ((events & (RAK_EVT_BUSY | RAK_EVT_PARAM_ERROR)) != 0U)
+    {
+      join_state = JOIN_STATE_STOP_RETRY_WAIT;
+      join_deadline = now + RAK_BUSY_BACKOFF_MS;
+      Debug_Log("[RAK] stop-auto-join not accepted; retry after backoff\r\n");
+    }
+    else if (TimeReached(now, join_deadline))
+    {
+      App_RequestReconnect(now, "RAK silent while disabling persisted auto-join");
+    }
     return;
   }
 
@@ -2151,8 +2253,7 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
     return;
   }
 
-  if (((events & RAK_EVT_BUSY) != 0U) &&
-      (join_state != JOIN_STATE_BATTERY_CHECK))
+  if ((events & RAK_EVT_BUSY) != 0U)
   {
     join_status_after_busy = true;
     join_state = JOIN_STATE_BUSY_BACKOFF;
@@ -2181,9 +2282,16 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
       join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
       Debug_Log("[RAK] status query after BUSY failed; no radio failure counted\r\n");
     }
+    else if ((join_state == JOIN_STATE_WAIT_ACCEPT) ||
+             (join_state == JOIN_STATE_WAIT_RESULT))
+    {
+      join_state = JOIN_STATE_WAIT_RESULT;
+      join_deadline = now + RAK_JOIN_RESULT_TIMEOUT_MS;
+      Debug_Log("[RAK] AT error did not complete the JOIN batch; still waiting for +EVT:JOINED\r\n");
+    }
     else
     {
-      RAK_RecordJoinFailure(now, "AT/status error after a real JOIN attempt");
+      App_RequestReconnect(now, "AT+NJS status error");
     }
     return;
   }
@@ -2191,7 +2299,21 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
   switch (join_state)
   {
     case JOIN_STATE_IDLE:
-      RAK_StartJoinAttempt(now);
+      RAK_StartJoinPreparation(now);
+      break;
+
+    case JOIN_STATE_STOP_RETRY_WAIT:
+      if (TimeReached(now, join_deadline))
+      {
+        RAK_StartJoinPreparation(now);
+      }
+      break;
+
+    case JOIN_STATE_START_WAIT:
+      if (TimeReached(now, join_deadline))
+      {
+        RAK_StartJoinAttempt(now);
+      }
       break;
 
     case JOIN_STATE_WAIT_ACCEPT:
@@ -2234,9 +2356,7 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
       }
       else if ((events & RAK_EVT_NJS_0) != 0U)
       {
-        join_state = JOIN_STATE_RETRY_WAIT;
-        join_deadline = now + RAK_JOIN_RETRY_DELAY_MS;
-        Debug_Log("[RAK] NJS=0; retry JOIN command without a total-attempt limit\r\n");
+        RAK_RecordJoinFailure(now, "controlled JOIN batch ended with NJS=0");
       }
       else if (TimeReached(now, join_deadline))
       {
@@ -2266,7 +2386,6 @@ static void RAK_HandleJoin(uint32_t now, uint32_t events)
       }
       break;
 
-    case JOIN_STATE_BATTERY_CHECK:
     default:
       break;
   }

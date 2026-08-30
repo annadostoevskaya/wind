@@ -976,6 +976,7 @@ $rtcStart = Get-CFunctionText -Text $finalMain -Name 'RTC_WakeupStart' -Context 
 $stopCycle = Get-CFunctionText -Text $finalMain -Name 'App_EnterStopCycle' -Context 'working main.c'
 $rotationMask = Get-CFunctionText -Text $finalMain -Name 'Rotation_SetExtiEnabled' -Context 'working main.c'
 $joinHandler = Get-CFunctionText -Text $finalMain -Name 'RAK_HandleJoin' -Context 'working main.c'
+$joinHealthHandler = Get-CFunctionText -Text $finalMain -Name 'App_StartJoinHealthCheck' -Context 'working main.c'
 $uplinkFailureHandler = Get-CFunctionText -Text $finalMain -Name 'RAK_CompleteUplinkFailure' -Context 'working main.c'
 $batteryCompletionHandler = Get-CFunctionText -Text $finalMain -Name 'Battery_HandleCompleted' -Context 'working main.c'
 $allCoreC = ((Get-ChildItem -LiteralPath (Join-Path $repositoryRoot 'Core\Src') -Filter '*.c' -File | ForEach-Object {
@@ -1003,11 +1004,12 @@ $integrationChecks = [ordered]@{
     'ADC half/full callbacks are both present' = [regex]::IsMatch($finalMain, 'HAL_ADC_ConvHalfCpltCallback') -and [regex]::IsMatch($finalMain, 'HAL_ADC_ConvCpltCallback')
     'shared EXTI15_10 NVIC is never disabled' = -not [regex]::IsMatch($finalMain, 'HAL_NVIC_DisableIRQ\(EXTI15_10_IRQn\)')
     'rotation masks only Freqency_Pin in EXTI IMR' = [regex]::IsMatch($rotationMask, 'AppLogic_ExtiMaskUpdate\(EXTI->IMR,\s*\(uint32_t\)Freqency_Pin,\s*(?:true|false)\)', 'Singleline')
-    'JOIN uses max RAK attempts and an unlimited STM32 retry loop' = [regex]::IsMatch($finalMain, 'AT\+JOIN=1:1:10:255\\r\\n') -and ((Get-DefineValue -Text $finalMain -Name 'RAK_JOIN_RETRY_DELAY_MS' -Context 'working main.c') -eq '10000U')
+    'JOIN uses controlled single attempts in groups of three' = [regex]::IsMatch($finalMain, 'AT\+JOIN=0\\r\\n') -and [regex]::IsMatch($finalMain, 'AT\+JOIN=1:0:10:1\\r\\n') -and ((Get-DefineValue -Text $finalMain -Name 'RAK_JOIN_ATTEMPTS_PER_BATCH' -Context 'working main.c') -eq '3U')
     'only the exact JOINED helper gates ACTIVE mode' = [regex]::IsMatch($joinHandler, 'if\s*\(AppLogic_JoinConfirmed\(events\)\)')
     'RAK receives a full power cycle after an uplink failure' = [regex]::IsMatch($uplinkFailureHandler, 'App_RequestReconnect\(now,\s*reason\)') -and (-not [regex]::IsMatch($uplinkFailureHandler, 'UPLINK_STATE_RETRY_WAIT'))
     'RAK boot and power-off waits are long enough for a real restart' = ((Get-DefineValue -Text $finalMain -Name 'RAK_BOOT_DELAY_MS' -Context 'working main.c') -eq '5000U') -and ((Get-DefineValue -Text $finalMain -Name 'RAK_POWER_OFF_DELAY_MS' -Context 'working main.c') -eq '1000U')
-    'battery check remains every ten completed JOIN failures' = ((Get-DefineValue -Text $finalMain -Name 'RAK_JOIN_FAILURES_PER_BATTERY_CHECK' -Context 'working main.c') -eq '10U')
+    'failed JOIN health check powers RAK off and observes rotation for five seconds' = [regex]::IsMatch($joinHealthHandler, 'App_SetExternalPower\(false,\s*false,\s*true,\s*false,\s*false\)') -and ((Get-DefineValue -Text $finalMain -Name 'JOIN_HEALTH_ROTATION_WINDOW_MS' -Context 'working main.c') -eq '5000U')
+    'failed JOIN shutdown keeps the low-battery AND zero-rotation gate' = [regex]::IsMatch($batteryCompletionHandler, 'BATTERY_REASON_JOIN_HEALTH.*?AppLogic_ShouldShutdown\(true,\s*battery_voltage,\s*BAT_LOW_THRESHOLD_V,\s*true,\s*join_health_rotation_pulses\).*?App_EnterEmergency', 'Singleline')
     'requested uplink period and BUSY retry are five seconds' = ((Get-DefineValue -Text $finalMain -Name 'UPLINK_PERIOD_MS' -Context 'working main.c') -eq '5000U') -and ((Get-DefineValue -Text $finalMain -Name 'UPLINK_BUSY_RETRY_MS' -Context 'working main.c') -eq '5000U')
     'first uplink is armed immediately after measurements start' = [regex]::IsMatch($finalMain, 'DS18B20_DiscoverCached\(now\).*?next_uplink_tick\s*=\s*now\s*;', 'Singleline')
     'shutdown requires both low battery and confirmed zero rotation' = [regex]::IsMatch($batteryCompletionHandler, 'BATTERY_REASON_ROTATION_STOP.*?AppLogic_ShouldShutdown\(true,\s*battery_voltage,\s*BAT_LOW_THRESHOLD_V,\s*true,\s*new_pulses\).*?App_EnterEmergency', 'Singleline')
