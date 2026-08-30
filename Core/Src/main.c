@@ -137,7 +137,7 @@ typedef struct
 
 #define MEASUREMENT_POWER_SETTLE_MS  100U
 #define ROTATION_REPORT_WINDOW_MS    2333U
-#define ROTATION_CHECK_WINDOW_MS     10000U /* ON_FR remains on for this window. */
+#define ROTATION_CHECK_WINDOW_MS     5000U /* ON_FR remains on for this window. */
 
 #define BATTERY_SETTLE_MS            50U
 #define BATTERY_AVERAGE_SAMPLES       8U
